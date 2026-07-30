@@ -1,0 +1,148 @@
+# askstack held-out set — 15 questions. PRD §7.1.
+#
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ SEALED UNTIL M5                                                         │
+# │                                                                         │
+# │ This file is authored at the same time as questions.yaml and scored     │
+# │ EXACTLY ONCE, at M5, as an overfitting check.                           │
+# │                                                                         │
+# │ Do not run an agent against it, tune anything on it, or read its        │
+# │ results before then. A held-out set consulted twice is not held out —   │
+# │ it is just a second golden set with a misleading name.                  │
+# └─────────────────────────────────────────────────────────────────────────┘
+#
+# Pinned revision: fastapi/fastapi@95f8322ee1dc  (commit date 2026-07-29)
+# Same schema and same freeze rule as questions.yaml. Deliberately disjoint:
+# no window, area, threshold, or issue thread is reused from that file.
+
+# ══════════════════════════════════════════════════ class 1 — delivery status
+
+- id: h001
+  class: 1
+  question: "Did the fix for line splitting in format_sse_event ship?"
+  as_of: "2026-07-29"
+  gold_tools: [pr_state]
+  gold_query: {method: entity, args: {kind: pr, ref: "15515"}}
+
+- id: h002
+  class: 1
+  question: "Has the API reference page for fastapi.sse been added?"
+  as_of: "2026-07-29"
+  gold_tools: [pr_state]
+  gold_query: {method: entity, args: {kind: pr, ref: "15930"}}
+
+- id: h003
+  class: 1
+  question: "Was version 0.140.0 released?"
+  as_of: "2026-07-29"
+  gold_tools: [release_info]
+  gold_query: {method: entity, args: {kind: release, ref: "0.140.0"}}
+
+- id: h004
+  class: 1
+  question: "Did the fix for sequences with nested Annotated types land?"
+  as_of: "2026-07-29"
+  gold_tools: [pr_state]
+  gold_query: {method: entity, args: {kind: pr, ref: "14874"}}
+
+# ════════════════════════════════════════════════ class 2 — change over time
+
+- id: h005
+  class: 2
+  question: "What merged during May 2026?"
+  as_of: "2026-07-29"
+  gold_tools: [merged_prs]
+  gold_query: {method: merged_prs, args: {since: "2026-05-01", until: "2026-06-01"}}
+
+- id: h006
+  class: 2
+  question: "What shipped in the second quarter of 2026?"
+  as_of: "2026-07-29"
+  gold_tools: [merged_prs]
+  gold_query: {method: merged_prs, args: {since: "2026-04-01", until: "2026-07-01"}}
+
+- id: h007
+  class: 2
+  question: "What changed between 0.130.0 and 0.138.0?"
+  as_of: "2026-07-29"
+  gold_tools: [release_diff]
+  gold_query: {method: release_diff, args: {from_tag: "0.130.0", to_tag: "0.138.0"}}
+
+- id: h008
+  class: 2
+  question: "What has merged in the last 14 days?"
+  as_of: "2026-07-29"
+  gold_tools: [merged_prs]
+  gold_query: {method: merged_prs, args: {since: "2026-07-15", until: "2026-07-29"}}
+
+# ══════════════════════════════════════ class 3 — ownership and activity
+
+- id: h009
+  class: 3
+  question: "Who has been working on middleware in 2026?"
+  as_of: "2026-07-29"
+  gold_tools: [commits_by_author]
+  gold_query: {method: commits_by_author, args: {since: "2026-01-01", area: middleware}}
+
+- id: h010
+  class: 3
+  question: "Who has committed to the codebase since the start of April?"
+  as_of: "2026-07-29"
+  gold_tools: [commits_by_author]
+  gold_query: {method: commits_by_author, args: {since: "2026-04-01"}}
+
+- id: h011
+  class: 3
+  # DELIBERATELY EMPTY. Every auth-area pull request merged in Feb or Mar 2026,
+  # so the correct answer here is "nothing". This is the PRD §5.2 test in its
+  # purest form: a system that invents plausible work, or reaches for the
+  # nearest non-empty window, fails outright. The scorer must treat an empty
+  # prediction against an empty gold set as a perfect score.
+  question: "Which pull requests touching authentication merged in the last three months?"
+  as_of: "2026-07-29"
+  expect_empty: true
+  gold_tools: [merged_prs]
+  gold_query:
+    {method: merged_prs, args: {since: "2026-04-29", until: "2026-07-29", area: auth}}
+
+# ═══════════════════════════════════════════ class 4 — blockers and risk
+
+- id: h012
+  class: 4
+  question: "Which open pull requests have had no review in the last 60 days?"
+  as_of: "2026-07-29"
+  gold_tools: [stale_prs]
+  gold_query: {method: stale_prs, args: {threshold_days: 60}}
+
+- id: h013
+  class: 4
+  question: "Which pull requests have been waiting more than 45 days for review?"
+  as_of: "2026-07-29"
+  gold_tools: [stale_prs]
+  gold_query: {method: stale_prs, args: {threshold_days: 45}}
+
+# ═══════════════════════════════════════ class 5 — decision archaeology
+
+- id: h014
+  class: 5
+  question: "Why wasn't msgpack content negotiation added to FastAPI directly?"
+  as_of: "2026-07-29"
+  gold_chunks: ["issue:521#comment-0", "issue:521#comment-1"]
+  gold_answer_points:
+    - "it could already be built on existing extension points without core changes"
+    - "a working example was assembled outside the framework"
+  gold_tools: [search_issues]
+
+# ═════════════════════════════════════════ class 6 — scope and existence
+
+- id: h015
+  class: 6
+  # Not issue 701 — that thread backs q050 in questions.yaml, and a held-out
+  # set sharing source spans with the tuning set does not measure overfitting.
+  question: "Is there a built-in way to read an OAuth2 bearer token from a cookie?"
+  as_of: "2026-07-29"
+  gold_chunks: ["issue:796#comment-0", "issue:796#comment-1"]
+  gold_answer_points:
+    - "no built-in scheme reads the token from a cookie"
+    - "it requires subclassing the OAuth2 security model to do so"
+  gold_tools: [search_issues, search_docs]

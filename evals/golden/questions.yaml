@@ -1,0 +1,459 @@
+# askstack golden set — 50 questions. PRD §7.1, TRD §14.1.
+#
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ FREEZE RULE                                                             │
+# │                                                                         │
+# │ No question in this file may be edited once an agent run has been       │
+# │ scored against it. Changes require a NEW id; the old one stays.         │
+# │                                                                         │
+# │ This is what makes "authored before the agent existed" a real claim     │
+# │ rather than a slogan. Without it the set drifts, one small edit at a    │
+# │ time, toward whatever the agent already happens to do well.             │
+# └─────────────────────────────────────────────────────────────────────────┘
+#
+# Pinned revision: fastapi/fastapi@95f8322ee1dc  (commit date 2026-07-29)
+# Every `as_of` is at or before that date, and the runner aborts on violation.
+#
+# Classes 1-4 are exactly checkable: `gold_query` names a FactsStore call and
+# `evals/build_gold.py` computes the answer from the pinned corpus. Do not
+# hand-write `gold_entities` here — it is generated into gold_entities.yaml.
+#
+# Classes 5-6 are interpretive. Their `gold_chunks` were chosen by READING the
+# issue threads, never by querying the retriever: candidates were surfaced from
+# the facts layer on structural signal alone (comment volume, feature/bug
+# labels). Citing what our own retrieval returns would make recall@5 measure
+# itself.
+#
+# Two question shapes are excluded by construction, following the precedent
+# PRD §4 sets for sprints:
+#   - milestones — FastAPI sets none (0 of 2,325 PRs, 0 of 3,542 issues)
+#   - open issues — there is exactly 1; support moved to GitHub Discussions
+# See README.md.
+
+# ══════════════════════════════════════════════════ class 1 — delivery status
+
+- id: q001
+  class: 1
+  question: "Did the fix for background tasks and headers from dependencies ship?"
+  as_of: "2026-07-29"
+  gold_tools: [pr_state]
+  gold_query: {method: entity, args: {kind: pr, ref: "16105"}}
+
+- id: q002
+  class: 1
+  question: "Has the fix for status_code being ignored on SSE and JSONL streaming endpoints landed?"
+  as_of: "2026-07-29"
+  gold_tools: [pr_state]
+  gold_query: {method: entity, args: {kind: pr, ref: "15937"}}
+
+- id: q003
+  class: 1
+  question: "Did app.frontend(check_dir=\"auto\") make it in?"
+  as_of: "2026-07-29"
+  gold_tools: [pr_state]
+  gold_query: {method: entity, args: {kind: pr, ref: "16102"}}
+
+- id: q004
+  class: 1
+  question: "Was version 0.141.0 actually released?"
+  as_of: "2026-07-29"
+  gold_tools: [release_info]
+  gold_query: {method: entity, args: {kind: release, ref: "0.141.0"}}
+
+- id: q005
+  class: 1
+  question: "Is the report that context managers in Depends broke after 0.106 closed?"
+  as_of: "2026-07-29"
+  gold_tools: [issue_state]
+  gold_query: {method: entity, args: {kind: issue, ref: "11143"}}
+
+- id: q006
+  class: 1
+  # The defining §5.2 failure is reporting unmerged work as shipped. PR 15806
+  # is titled "Release version 0.138.0" and was CLOSED WITHOUT MERGING -- a
+  # system that pattern-matches the title will get this wrong.
+  question: "Did pull request 15806 ship?"
+  as_of: "2026-07-29"
+  gold_tools: [pr_state]
+  gold_query: {method: entity, args: {kind: pr, ref: "15806"}}
+
+- id: q007
+  class: 1
+  question: "Has the refactor of jsonable_encoder in pull request 5718 been merged?"
+  as_of: "2026-07-29"
+  gold_tools: [pr_state]
+  gold_query: {method: entity, args: {kind: pr, ref: "5718"}}
+
+- id: q008
+  class: 1
+  question: "Did the fix for response_model params being ignored on non-generator endpoints ship?"
+  as_of: "2026-07-29"
+  gold_tools: [pr_state]
+  gold_query: {method: entity, args: {kind: pr, ref: "15093"}}
+
+# ════════════════════════════════════════════════ class 2 — change over time
+
+- id: q009
+  class: 2
+  question: "What shipped in the last 7 days?"
+  as_of: "2026-07-29"
+  gold_tools: [merged_prs]
+  gold_query: {method: merged_prs, args: {since: "2026-07-22", until: "2026-07-29"}}
+
+- id: q010
+  class: 2
+  question: "What shipped in the last 30 days?"
+  as_of: "2026-07-29"
+  gold_tools: [merged_prs]
+  gold_query: {method: merged_prs, args: {since: "2026-06-29", until: "2026-07-29"}}
+
+- id: q011
+  class: 2
+  question: "What merged during June 2026?"
+  as_of: "2026-07-29"
+  gold_tools: [merged_prs]
+  gold_query: {method: merged_prs, args: {since: "2026-06-01", until: "2026-07-01"}}
+
+- id: q012
+  class: 2
+  question: "What merged in the first quarter of 2026?"
+  as_of: "2026-07-29"
+  gold_tools: [merged_prs]
+  gold_query: {method: merged_prs, args: {since: "2026-01-01", until: "2026-04-01"}}
+
+- id: q013
+  class: 2
+  question: "What changed between version 0.140.0 and version 0.141.0?"
+  as_of: "2026-07-29"
+  gold_tools: [release_diff]
+  gold_query: {method: release_diff, args: {from_tag: "0.140.0", to_tag: "0.141.0"}}
+
+- id: q014
+  class: 2
+  question: "What went into the 0.139.0 to 0.140.0 range?"
+  as_of: "2026-07-29"
+  gold_tools: [release_diff]
+  gold_query: {method: release_diff, args: {from_tag: "0.139.0", to_tag: "0.140.0"}}
+
+- id: q015
+  class: 2
+  question: "What has merged since the 0.138.0 release?"
+  as_of: "2026-07-29"
+  gold_tools: [merged_prs]
+  gold_query: {method: merged_prs, args: {since: "2026-06-19", until: "2026-07-29"}}
+
+- id: q016
+  class: 2
+  question: "What shipped in the first half of 2026?"
+  as_of: "2026-07-29"
+  gold_tools: [merged_prs]
+  gold_query: {method: merged_prs, args: {since: "2026-01-01", until: "2026-07-01"}}
+
+- id: q017
+  class: 2
+  question: "What merged in the whole of 2025?"
+  as_of: "2026-07-29"
+  gold_tools: [merged_prs]
+  gold_query: {method: merged_prs, args: {since: "2025-01-01", until: "2026-01-01"}}
+
+# ══════════════════════════════════════ class 3 — ownership and activity
+
+- id: q018
+  class: 3
+  question: "Who has been working on the routing layer this year?"
+  as_of: "2026-07-29"
+  gold_tools: [commits_by_author]
+  gold_query: {method: commits_by_author, args: {since: "2026-01-01", area: routing}}
+
+- id: q019
+  class: 3
+  question: "Who has touched authentication and security code in 2026?"
+  as_of: "2026-07-29"
+  gold_tools: [commits_by_author]
+  gold_query: {method: commits_by_author, args: {since: "2026-01-01", area: auth}}
+
+- id: q020
+  class: 3
+  question: "Who has been working on OpenAPI schema generation since June?"
+  as_of: "2026-07-29"
+  gold_tools: [commits_by_author]
+  gold_query: {method: commits_by_author, args: {since: "2026-06-01", area: openapi}}
+
+- id: q021
+  class: 3
+  question: "Who has committed anything at all in the last month?"
+  as_of: "2026-07-29"
+  gold_tools: [commits_by_author]
+  gold_query: {method: commits_by_author, args: {since: "2026-06-29"}}
+
+- id: q022
+  class: 3
+  question: "Which pull requests touching the routing layer merged in 2026?"
+  as_of: "2026-07-29"
+  gold_tools: [merged_prs]
+  gold_query:
+    {method: merged_prs, args: {since: "2026-01-01", until: "2026-07-29", area: routing}}
+
+- id: q023
+  class: 3
+  question: "Which merged work in 2026 touched websockets or server-sent events?"
+  as_of: "2026-07-29"
+  gold_tools: [merged_prs]
+  gold_query:
+    {method: merged_prs, args: {since: "2026-01-01", until: "2026-07-29", area: websockets}}
+
+- id: q024
+  class: 3
+  question: "Which documentation changes merged in the last 30 days?"
+  as_of: "2026-07-29"
+  gold_tools: [merged_prs]
+  gold_query:
+    {method: merged_prs, args: {since: "2026-06-29", until: "2026-07-29", area: docs}}
+
+# ═══════════════════════════════════════════ class 4 — blockers and risk
+
+- id: q025
+  class: 4
+  question: "Which pull requests have been sitting in review for over two weeks?"
+  as_of: "2026-07-29"
+  gold_tools: [stale_prs]
+  gold_query: {method: stale_prs, args: {threshold_days: 14}}
+
+- id: q026
+  class: 4
+  question: "Which open pull requests have had no review activity in the last 30 days?"
+  as_of: "2026-07-29"
+  gold_tools: [stale_prs]
+  gold_query: {method: stale_prs, args: {threshold_days: 30}}
+
+- id: q027
+  class: 4
+  question: "What has been stuck in review for more than three months?"
+  as_of: "2026-07-29"
+  gold_tools: [stale_prs]
+  gold_query: {method: stale_prs, args: {threshold_days: 90}}
+
+- id: q028
+  class: 4
+  question: "Which pull requests have gone six months without a review?"
+  as_of: "2026-07-29"
+  gold_tools: [stale_prs]
+  gold_query: {method: stale_prs, args: {threshold_days: 180}}
+
+- id: q029
+  class: 4
+  # Not a 7-day threshold: every open pull request here predates that, so 7 and
+  # 14 days return the identical set and the two questions would double-count
+  # the same retrieval. Thresholds must actually discriminate to be worth
+  # scoring separately.
+  question: "Which open pull requests have been abandoned for over two years?"
+  as_of: "2026-07-29"
+  gold_tools: [stale_prs]
+  gold_query: {method: stale_prs, args: {threshold_days: 730}}
+
+- id: q030
+  class: 4
+  question: "Which open pull requests have been waiting more than a year?"
+  as_of: "2026-07-29"
+  gold_tools: [stale_prs]
+  gold_query: {method: stale_prs, args: {threshold_days: 365}}
+
+# ═══════════════════════════════════════ class 5 — decision archaeology
+
+- id: q031
+  class: 5
+  question: "Why wasn't context-manager support added to startup and shutdown events when it was first proposed?"
+  as_of: "2026-07-29"
+  gold_chunks: ["issue:617#comment-0", "issue:617#comment-1", "issue:617#comment-2"]
+  gold_answer_points:
+    - "the events were inherited from Starlette almost unmodified"
+    - "adding context managers would introduce maintenance burden FastAPI did not carry before"
+  gold_tools: [search_issues]
+
+- id: q032
+  class: 5
+  question: "Why does FastAPI not provide first-class session support?"
+  as_of: "2026-07-29"
+  gold_chunks: ["issue:754#comment-1", "issue:754#comment-10"]
+  gold_answer_points:
+    - "maintainability: preference for an implementation powered by Starlette features"
+    - "FastAPI would add the dependency-injection and OpenAPI layer rather than the storage"
+  gold_tools: [search_issues]
+
+- id: q033
+  class: 5
+  question: "What changed about dependency cleanup in release 0.106, and why did it break streaming responses?"
+  as_of: "2026-07-29"
+  gold_chunks: ["issue:11143#comment-0", "issue:11143#comment-1"]
+  gold_answer_points:
+    - "dependencies with yield now close before the response is sent"
+    - "StreamingResponse bodies run after cleanup, so the resource is already gone"
+  gold_tools: [search_issues]
+
+- id: q034
+  class: 5
+  question: "Why was the UUID and dataclass annotation problem not fixed in FastAPI itself?"
+  as_of: "2026-07-29"
+  gold_chunks: ["issue:10007#comment-1"]
+  gold_answer_points:
+    - "the behaviour belongs to Pydantic, not FastAPI"
+    - "it was tracked upstream in the Pydantic issue tracker"
+  gold_tools: [search_issues]
+
+- id: q035
+  class: 5
+  question: "What was the reasoning against globally customising the 422 validation error response?"
+  as_of: "2026-07-29"
+  gold_chunks: ["issue:1376#comment-0", "issue:1376#comment-1"]
+  gold_answer_points:
+    - "a custom exception handler already solves the response shape"
+    - "the remaining gap is the OpenAPI documentation, not the runtime behaviour"
+  gold_tools: [search_issues]
+
+- id: q036
+  class: 5
+  question: "Why does FastAPI struggle with Annotated and forward references?"
+  as_of: "2026-07-29"
+  gold_chunks: ["issue:13056#comment-1"]
+  gold_answer_points:
+    - "the Dependant is built at route creation, before the forward reference can resolve"
+    - "it would need its own annotation-evaluation and rebuild step"
+  gold_tools: [search_issues]
+
+- id: q037
+  class: 5
+  question: "What was the argument for documenting resource setup and teardown properly rather than leaving it to users?"
+  as_of: "2026-07-29"
+  gold_chunks: ["issue:617#comment-8", "issue:617#comment-9"]
+  gold_answer_points:
+    - "apps break in expected ways when connections are not released, especially under reload"
+    - "the tutorial already covers advanced features, so this belongs there too"
+  gold_tools: [search_issues]
+
+- id: q038
+  class: 5
+  question: "Why did passing UploadFile into a StreamingResponse stop working in 0.106?"
+  as_of: "2026-07-29"
+  gold_chunks: ["issue:10857#comment-0", "issue:10857#comment-1"]
+  gold_answer_points:
+    - "the file is closed during dependency cleanup before the stream is consumed"
+    - "reads then raise I/O operation on closed file"
+  gold_tools: [search_issues]
+
+- id: q039
+  class: 5
+  question: "What did maintainers say about database connections piling up when middleware and async dependencies are combined?"
+  as_of: "2026-07-29"
+  gold_chunks: ["issue:4719#comment-0", "issue:4719#comment-1"]
+  gold_answer_points:
+    - "the regression was traced to a specific release"
+    - "connections were not being closed, exhausting the pool"
+  gold_tools: [search_issues]
+
+- id: q040
+  class: 5
+  question: "How was the OpenAPI validation failure after upgrading from 0.98.0 to 0.99.0 resolved?"
+  as_of: "2026-07-29"
+  gold_chunks: ["issue:9780#comment-0"]
+  gold_answer_points:
+    - "it was fixed in a patch release"
+  gold_tools: [search_issues]
+
+- id: q041
+  class: 5
+  question: "Why was the jsonable_encoder crash with database Record objects not a FastAPI bug?"
+  as_of: "2026-07-29"
+  gold_chunks: ["issue:36#comment-0"]
+  gold_answer_points:
+    - "the Record type lacked __iter__ at the time"
+    - "it works once the driver provides that method"
+  gold_tools: [search_issues]
+
+- id: q042
+  class: 5
+  question: "What proposal was made for controlling when a dependency is closed relative to the response?"
+  as_of: "2026-07-29"
+  gold_chunks: ["issue:11143#comment-10"]
+  gold_answer_points:
+    - "a flag on Depends selecting cleanup before or after the response"
+    - "closing before allows raising HTTPException from cleanup"
+  gold_tools: [search_issues]
+
+# ═════════════════════════════════════════ class 6 — scope and existence
+
+- id: q043
+  class: 6
+  question: "Do websocket routes work on APIRouter, or only on the FastAPI app?"
+  as_of: "2026-07-29"
+  gold_chunks: ["issue:98#comment-0"]
+  gold_answer_points:
+    - "they work on APIRouter"
+    - "support was added by a pull request and released"
+  gold_tools: [search_docs, pr_state]
+
+- id: q044
+  class: 6
+  question: "Does FastAPI support server-sent events?"
+  as_of: "2026-07-29"
+  gold_chunks: ["issue:11143#comment-0"]
+  gold_answer_points:
+    - "yes — there is a dedicated SSE module"
+  gold_tools: [search_docs, merged_prs]
+
+- id: q045
+  class: 6
+  question: "Is there a supported way to customise the validation error response body?"
+  as_of: "2026-07-29"
+  gold_chunks: ["issue:1376#comment-0"]
+  gold_answer_points:
+    - "yes — override the request validation exception handler"
+    - "the documented behaviour and the OpenAPI schema can diverge"
+  gold_tools: [search_docs]
+
+- id: q046
+  class: 6
+  question: "Does FastAPI ship built-in session storage?"
+  as_of: "2026-07-29"
+  gold_chunks: ["issue:754#comment-1", "issue:754#comment-10"]
+  gold_answer_points:
+    - "no first-class session backend is provided"
+    - "it is expected to come from Starlette middleware or an external package"
+  gold_tools: [search_issues, search_docs]
+
+- id: q047
+  class: 6
+  question: "Can a dependency that yields be used to hold a resource open for a streaming response?"
+  as_of: "2026-07-29"
+  gold_chunks: ["issue:11143#comment-1", "issue:10857#comment-1"]
+  gold_answer_points:
+    - "not since 0.106 — cleanup runs before the stream is consumed"
+    - "the workaround is to acquire the resource inside the endpoint"
+  gold_tools: [search_issues]
+
+- id: q048
+  class: 6
+  question: "Are startup and shutdown events still the recommended way to manage application lifecycle?"
+  as_of: "2026-07-29"
+  gold_chunks: ["issue:617#body", "issue:617#comment-2"]
+  gold_answer_points:
+    - "lifespan replaced the on_event decorators"
+    - "the original events came from Starlette"
+  gold_tools: [search_docs]
+
+- id: q049
+  class: 6
+  question: "Does FastAPI evaluate forward references in dependency annotations?"
+  as_of: "2026-07-29"
+  gold_chunks: ["issue:13056#comment-1"]
+  gold_answer_points:
+    - "not fully — the Dependant is built before the reference resolves"
+  gold_tools: [search_issues]
+
+- id: q050
+  class: 6
+  question: "Is timing instrumentation for framework overhead built into FastAPI?"
+  as_of: "2026-07-29"
+  gold_chunks: ["issue:701#comment-0"]
+  gold_answer_points:
+    - "not provided as a built-in feature"
+  gold_tools: [search_issues, search_docs]
