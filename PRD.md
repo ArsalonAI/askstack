@@ -54,7 +54,7 @@ They are not the person implementing the code. Answers must not assume they will
 
 ## 4. Scope
 
-One repository, ingested at a pinned revision. Default target is **FastAPI** (`tiangolo/fastapi`) — active development, real milestones and releases, and a public PR and issue history deep enough to ask real status questions of. Configurable; any active repository works.
+One repository, ingested at a pinned revision. Default target is **FastAPI** (`fastapi/fastapi`, formerly `tiangolo/fastapi`) — active development, real milestones and releases, and a public PR and issue history deep enough to ask real status questions of. Configurable; any active repository works.
 
 **Primary sources** are the delivery record: pull requests, commits, issues, labels, milestones, and releases.
 **Supporting sources** are documentation and source code — used to confirm that something claimed to exist actually does.
