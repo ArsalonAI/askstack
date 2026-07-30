@@ -14,9 +14,25 @@ Status questions get a **structured facts layer** alongside the semantic index, 
 ```bash
 cp .env.example .env          # fill in ANTHROPIC_API_KEY, GITHUB_TOKEN
 docker compose up -d          # Postgres + pgvector on :5432, Langfuse on :3000
+uv sync --extra dev
+uv run alembic -c scripts/migrations/alembic.ini upgrade head
 ```
 
 Then open Langfuse at <http://localhost:3000>, create a project, and paste its keys into `.env`.
+
+<details>
+<summary>Without Docker</summary>
+
+Against an existing Postgres 16+ with [pgvector](https://github.com/pgvector/pgvector) installed (`brew install pgvector`):
+
+```bash
+createdb askstack
+psql -d askstack -f scripts/init_db.sql   # extensions; needs superuser
+```
+
+Point `DATABASE_URL` at it and run the migration as above. `pytest` uses a separate `askstack_test` database and creates it on first run — the schema tests downgrade to base on teardown, so they must never share a database with a real corpus.
+
+</details>
 
 Ingest and the service arrive with M0/M2 — see the milestone table in the PRD.
 

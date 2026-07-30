@@ -238,10 +238,12 @@ class FactsStore(Protocol):
 
     async def open_issues(
         self, label: str | None = None, milestone: str | None = None,
-        older_than_days: int | None = None,
+        older_than_days: int | None = None, *, as_of: datetime | None = None,
     ) -> Aggregate: ...
 
-    async def stale_prs(self, threshold_days: int) -> Aggregate:
+    async def stale_prs(
+        self, threshold_days: int, *, as_of: datetime | None = None,
+    ) -> Aggregate:
         """Open, non-draft, no review activity within the threshold."""
 
     async def commits_by_author(
@@ -253,6 +255,10 @@ class FactsStore(Protocol):
 
     async def release_diff(self, from_tag: str, to_tag: str) -> Aggregate: ...
 ```
+
+**Every age-relative method takes `as_of`.** "Stale for more than 14 days" measured against wall-clock `now()` returns a different set every day, which makes a class-4 golden question unreproducible and shows up in the eval as a retrieval regression rather than as clock drift. This is the "date-anchored answers rot" risk in PRD §9; the parameter is the mitigation, and the eval runner always passes the question's `as_of`.
+
+**Two filters this corpus cannot exercise.** FastAPI sets no GitHub milestones (0 of 2,325 pull requests, 0 of 3,542 issues) and carries exactly one open issue, having moved support traffic to Discussions years ago. `milestone=` and most `open_issues` shapes are therefore correct code with no data behind them here. Following the precedent PRD §4 sets for sprints, they are excluded from the golden set by construction rather than left to fail silently — class-4 questions lean on stale pull requests and labels instead.
 
 `entity()` is the smallest and most important method here. It is what turns "a design document says we support websockets" into "…and the pull request that implemented it merged on 2026-03-14", which is the PRD §5.2 requirement in one call.
 
@@ -342,7 +348,7 @@ class Consolidator(Protocol):
 
 ## 4. Data model
 
-Postgres 16 with `vector` and `pg_trgm`. Migrations via Alembic in `scripts/migrations/`. `scripts/init_db.sql` only creates extensions — it is a bootstrap, superseded by migration `0001` at M1.
+Postgres 16 with `vector` and `pg_trgm`. Migrations via Alembic in `scripts/migrations/`. `scripts/init_db.sql` only creates extensions — it is a bootstrap, superseded by migration `0001`, which lands at M0 because M0's exit criteria is an ingested corpus and ingest needs tables.
 
 ```sql
 -- ---------------------------------------------------------------- corpus
@@ -544,6 +550,24 @@ CREATE INDEX tool_defs_embedding_idx ON tool_defs
     USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
 CREATE INDEX tool_defs_synthetic_idx ON tool_defs (is_synthetic);
 
+-- ---------------------------------------------------------------- ingest
+-- The completion marker §4.2 depends on. `completed_at` is set only once BOTH
+-- the facts layer and the semantic index have been written; a partial ingest
+-- leaves it NULL and the service refuses to start.
+CREATE TABLE ingest_runs (
+    id              TEXT PRIMARY KEY,
+    corpus_repo     TEXT NOT NULL,
+    corpus_ref      TEXT NOT NULL,        -- symbolic ref as requested
+    resolved_sha    TEXT NOT NULL,        -- the pinned revision actually ingested
+    since           TIMESTAMPTZ,          -- ingest window floor; NULL = full history
+    embedding_model TEXT NOT NULL,
+    started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at    TIMESTAMPTZ,          -- NULL = partial
+    stats           JSONB NOT NULL DEFAULT '{}'
+);
+CREATE INDEX ingest_runs_complete_idx ON ingest_runs (completed_at DESC)
+    WHERE completed_at IS NOT NULL;
+
 -- ---------------------------------------------------------------- eval
 CREATE TABLE eval_runs (
     id           TEXT PRIMARY KEY,
@@ -587,10 +611,11 @@ There are two kinds. **Span citations** point at retrieved text and are `chunks.
 ```
 citation     := span_cite | entity_cite
 
-span_cite    := docs_cite | code_cite | comment_cite
+span_cite    := docs_cite | code_cite | comment_cite | body_cite
 docs_cite    := "docs:" path "#" slug             e.g. docs:advanced/events.md#lifespan
 code_cite    := "code:" path ":L" start "-L" end  e.g. code:fastapi/routing.py:L280-L340
 comment_cite := "issue:" number "#comment-" n     e.g. issue:1234#comment-5
+body_cite    := "issue:" number "#body" ["-" n]   e.g. issue:1234#body
 
 entity_cite  := pr_cite | commit_cite | issue_ref | release_cite
 pr_cite      := "pr:" number                      e.g. pr:11234
@@ -601,15 +626,25 @@ release_cite := "release:" tag                    e.g. release:0.110.0
 
 `issue:1234` and `issue:1234#comment-5` are deliberately the same prefix: the bare form is the entity ("this issue is still open"), the fragment form is a span ("here is what Sebastián said about it"). The presence of a fragment is what disambiguates, so a citation parser must check for it before dispatching to the facts layer.
 
+**The issue body is `issue:1234#body`, not the bare form.** An earlier draft gave the body chunk the bare `issue:1234`, which made one string mean both "this issue is still open" and "this paragraph of its description" — precisely the ambiguity the fragment rule exists to prevent. With `#body`, the bare form is *only ever* an entity citation, and every `chunks.id` carries a fragment.
+
+**`docs:path#slug` is not unique on its own, and the ingest must make it so.** A heading slug repeats whenever a document reuses a heading — FastAPI's release notes carry a `### Docs` and a `### Fixes` under every one of 299 versions — and an oversized section emits several parts from one heading. Both cases allocate through a single per-document counter: the first chunk keeps the bare `docs:path#slug`, and each subsequent collision appends `-2`, `-3`, and so on. One allocator rather than two suffix schemes, because two schemes that must never overlap eventually do. Document order is fixed at a pinned `CORPUS_REF`, so the allocation is stable across re-ingest, which is the property this section actually requires.
+
 Line numbers make `code_cite` unstable under upstream edits — accepted, because `CORPUS_REF` pins a ref. Ingest at a different ref invalidates code citations in the golden set; the golden set therefore records the ref it was authored against and the eval runner fails loudly on mismatch rather than silently scoring against shifted lines.
 
 ### 5.2 Chunking
 
+**The chunk budget is the embedding model's window, not a round number.** `bge-small-en-v1.5` truncates at 512 tokens: anything longer is embedded from its opening and the remainder is silently discarded. An 800-token target therefore guaranteed loss — measured against the real corpus, 25.4% of chunks exceeded the window, and issue chunks were 42% over, the largest being 75,427 tokens embedded from its first 0.7%. The budget is `512 − 48` for the breadcrumb or header prefix each chunk carries, and **every** splitter overlaps by 96 tokens.
+
+Two properties hold at every boundary. A split lands *between* whole units — paragraphs for prose, statements for code, comments for threads — so no sentence is ever cut mid-way. And where the trailing units fit inside the overlap budget, they are repeated at the head of the next chunk, so a fact that straddles a boundary stays retrievable from both sides.
+
 | Source | Strategy |
 |---|---|
-| **Docs** | Parse Markdown to a heading tree. One chunk per leaf section; sections over 800 tokens split on paragraph boundaries with 100-token overlap; sections under 100 tokens merge into the next sibling. Chunk text is prefixed with its heading breadcrumb (`# Advanced > Events > Lifespan`) so an isolated chunk retains context. |
-| **Code** | `ast.parse` per file; one chunk per top-level function, class, and module-level assignment block. The chunk carries the enclosing class name and the full docstring. Functions over 800 tokens are emitted whole — splitting a function body destroys the thing that makes it retrievable. Files that fail to parse fall back to 800-token windows. |
-| **Issues** | One chunk for the issue body (title + body + labels), one per comment thread of up to 5 consecutive comments. Bot comments are dropped by author allowlist. Closed issues only — open issues describe problems, not resolutions, and pollute an answer corpus. |
+| **Docs** | Parse Markdown to a heading tree. One chunk per leaf section; oversized sections split on paragraph boundaries with overlap; sections under 100 tokens merge into the next sibling, which keeps *its own* heading. Chunk text is prefixed with its heading breadcrumb (`# Advanced > Events > Lifespan`) so an isolated chunk retains context. MkDocs explicit anchors (`## Lifespan { #lifespan }`) are used verbatim as the citation slug — the braced anchor is what the published page renders, so a derived slug would point at an anchor that does not exist. |
+| **Code** | `ast.parse` per file; one chunk per top-level function, class, and module-level assignment block, plus one per method. The chunk carries the enclosing class name and the full docstring. Oversized functions split with overlap and the `path :: anchor` header repeated on every part; each part reports its **real line range**, so a split function still yields honest citations. Files that fail to parse fall back to overlapping line windows. |
+| **Issues** | One chunk per part of the issue body (title + labels + body), cited as `issue:N#body`; one per comment run of at most 5 comments *and* at most one window of tokens. Bot comments are dropped by author denylist. Closed issues only — open issues describe problems, not resolutions, and pollute an answer corpus. |
+
+**Why oversized functions are no longer emitted whole.** The original rule reasoned that splitting a function body destroys what makes it retrievable. That holds against a naive split, but it loses to the embedder: a 4,000-token function emitted whole is *already* invisible past its opening 512 tokens. Splitting with overlap, and repeating the header on every part, keeps each piece both embeddable and identifiable.
 
 ### 5.3 Idempotency and delta detection
 
@@ -630,10 +665,29 @@ Four paginated REST endpoints, 100 per page, all cached to `.cache/gh/` keyed by
 |---|---|---|
 | `/issues?state=all` | `issues`, `issue_labels`, and issue chunks | GitHub returns PRs from this endpoint too — filter on the `pull_request` key or the two tables collide |
 | `/pulls?state=all` + `/pulls/{n}/files` + `/pulls/{n}/reviews` | `pull_requests`, `pr_files`, `pr_reviews` | Three calls per PR; this dominates ingest wall time, hence the cache |
-| `/commits` | `commits`, `commit_files` | `since` cursor from the last completed ingest |
+| `/commits` + `/commits/{sha}` | `commits`, `commit_files` | The list endpoint omits `files`; only the detail call has them. Commits are immutable, so their cache key needs no version component |
 | `/releases` | `releases` | Small, refetched whole each run |
 
-Backoff on 403 secondary rate limits using the `Retry-After` header. `GITHUB_TOKEN` needs `public_repo` scope only.
+Backoff on 403 secondary rate limits using the `Retry-After` header, and wait for `X-RateLimit-Reset` when the primary budget is spent — a first ingest runs close enough to the 5,000/hour ceiling that failing instead of waiting would leave the corpus half-built.
+
+`GITHUB_TOKEN` needs **read-only access to public repositories and no permissions at all** — a fine-grained token with "Public Repositories (read-only)". The classic `public_repo` scope also works but grants *write* access to every public repository on GitHub, which contradicts the PRD §2 non-goal that askstack never writes to the repository.
+
+Three details that are not obvious from the endpoint list:
+
+- **`additions`/`deletions` are derived, not fetched.** The `/pulls` list omits them and only the per-PR detail call carries them, which would be a fourth call per PR. Summing the `/pulls/{n}/files` rows we already have gives identical numbers for free.
+- **A commit finds its PR from its message.** FastAPI squash-merges as `Title (#1234)`, so `commits.pr_number` is parsed rather than looked up, avoiding a call per commit.
+- **`issues.closed_by_pr` is parsed from PR bodies.** The timeline API reports it directly at the cost of one call per issue; the closing-keyword regex over bodies we already have is free.
+
+#### Two window floors
+
+`INGEST_SINCE` bounds pull requests and commits. `INGEST_ISSUES_SINCE` bounds issues, and defaults to unbounded. They differ because the two substrates want opposite things:
+
+| Source | Window | Why |
+|---|---|---|
+| PRs, commits | recent (`2025-01-01`) | The facts layer answers "what shipped last month". Three calls per PR makes depth expensive |
+| Issues | full history | Decision archaeology lives in the archive. FastAPI has 3,541 closed issues but only 89 created since 2025 — support traffic moved to Discussions years ago, so windowing issues the same way would starve PRD classes 5–6 |
+
+The consequence is that an issue can be closed by a pull request outside the PR window. Ingest sets `closed_by_pr` only when the PR is actually present and **counts the links it dropped** into `ingest_runs.stats`. A silently dropped foreign key becomes an unexplainable eval gap weeks later.
 
 **Open issues are fetched now.** The chunking rule in §5.2 still indexes only *closed* issues for semantic search — an open issue describes a problem, not a resolution, and pollutes an answer corpus. But open issues are entities in the facts layer, because "what's still open on the v2 milestone" is a class-4 question and requires them.
 
@@ -1194,7 +1248,7 @@ Only the LLM-judge and agent calls need network. Embeddings are local, so the re
 | Concern | Handling |
 |---|---|
 | `run_snippet` | Subprocess with no network, a read-only bind mount of the corpus checkout, a 5 s CPU limit, and a 256 MB memory cap. Not exposed until M2, and disabled by default via `ENABLE_RUN_SNIPPET=false`. |
-| `GITHUB_TOKEN` | `public_repo` scope only. Read at ingest, never passed to the model, never written to a memory row. |
+| `GITHUB_TOKEN` | A fine-grained token with read-only access to public repositories and **no permissions**. Every ingest call is a GET against public data, so no scope is required; the classic `public_repo` scope would grant write access to every public repo on GitHub and contradict the PRD §2 non-goal. Read at ingest, never passed to the model, never written to a memory row. |
 | Secrets in memory | The extraction prompt forbids recording credentials, and a regex denylist (`sk-`, `ghp_`, `AKIA`, bearer patterns) rejects matching statements before write. Memory rows are replayed into future prompts, so a secret written once leaks into every later session. |
 | PII in episodic memory | Same path. Single-user demo, no third-party data, but `GET /memory` and revert give the user a delete-equivalent (supersede) for anything recorded. |
 | Prompt injection from the corpus | Issue bodies are untrusted text. Retrieved chunks are wrapped in `<document>` tags with an explicit instruction that document content is data, never instructions. Corpus content can never trigger `memory_write` — that tool is only callable from the model's own turn, and written memories carry `created_by='agent'` for audit. |

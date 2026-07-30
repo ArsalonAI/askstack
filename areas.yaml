@@ -1,0 +1,55 @@
+# Curated area -> path mapping. TRD §5.5, ADR 16.
+#
+# Hand-authored on purpose, and deliberately short. "The payments module" is a
+# human concept with no reliable signal in the file tree; heuristics over
+# directory names or the import graph produce mappings that are wrong in ways
+# nobody notices until an ownership answer names the wrong person. A small
+# curated file is at least honest about being curated.
+#
+# Adding an area is cheap. Adding a *wrong* area silently corrupts every
+# ownership answer that touches it, so only add ones you can defend.
+#
+# Globs are matched as prefixes against `pr_files.path` / `commit_files.path`,
+# so `fastapi/security/**` means "anything under fastapi/security/".
+
+- name: auth
+  description: Authentication, authorization, and security utilities
+  path_globs:
+    - fastapi/security/**
+    - tests/test_security*
+
+- name: routing
+  description: Request routing, path operations, and dependency resolution
+  path_globs:
+    - fastapi/routing.py
+    - fastapi/dependencies/**
+    - fastapi/params.py
+    - fastapi/param_functions.py
+    - tests/test_router*
+    - tests/test_dependency*
+
+- name: openapi
+  description: OpenAPI schema generation and the interactive docs UI
+  path_globs:
+    - fastapi/openapi/**
+    - tests/test_openapi*
+
+- name: middleware
+  description: ASGI middleware, CORS, GZip, and trusted-host handling
+  path_globs:
+    - fastapi/middleware/**
+    - tests/test_middleware*
+
+- name: websockets
+  description: WebSocket and server-sent-event endpoints
+  path_globs:
+    - fastapi/websockets.py
+    - fastapi/sse.py
+    - tests/test_ws*
+    - tests/test_websocket*
+
+- name: docs
+  description: Prose documentation and its runnable examples
+  path_globs:
+    - docs/**
+    - docs_src/**
