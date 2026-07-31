@@ -34,6 +34,11 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# The project is not installed into the venv (no build-system), so `app` and
+# `evals` are only importable if the repo root is on the path. Without this,
+# bare `pytest` fails at conftest import while `python -m pytest` works — and
+# the README documents the former.
+pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100

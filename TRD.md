@@ -1159,14 +1159,18 @@ Golden-set entries carry a `class` (1–6 per PRD §5.1) and an `as_of` date. Th
   gold_tools: [search_issues]
 ```
 
-| Class | Scorer | Gated |
-|---|---|:--:|
-| 1–4 | **Aggregate set-F1** — precision/recall of returned entity set vs. `gold_entities` | ✅ |
-| 5–6 | recall@5, MRR@10 over `gold_chunks` | ✅ |
-| all | tool-selection accuracy, citation resolution | ✅ |
-| all | grounding, coverage (LLM-judged) | report-only |
+| Class | Scorer | Gated | From |
+|---|---|:--:|:--:|
+| 1–4 | **Aggregate set-F1** — precision/recall of returned entity set vs. `gold_entities` | ✅ | M1 |
+| 5–6 | recall@5, MRR@10 over `gold_chunks` | ✅ | M1 |
+| all | tool-selection accuracy, citation resolution | ✅ | M2 |
+| all | grounding, coverage (LLM-judged) | report-only | M2 |
 
 **Set-F1 is computed against the tool's result set, not the prose.** The scorer reads the `retrieval` SSE events, so it measures what the system retrieved rather than what the model said about it. Whether the prose faithfully reflects that set is a separate question, answered by citation resolution.
+
+**The runner has two shapes, because M1 has no agent.** At M1 there is no orchestrator, no `tools[]`, and no SSE stream to read: the runner calls `FactsStore` and `Retriever` directly. That is enough for the three retrieval metrics — set-F1, recall@5, and MRR@10 need no model in the loop — and it is what PRD §8 asks M1 to commit a baseline for. Tool-selection accuracy and citation resolution are properties of an agent turn and cannot be measured before one exists; they arrive at M2, when the runner switches to driving `POST /chat` and scoring the `retrieval` events described above. The direct-call path is kept after M2 rather than deleted, because it isolates a retrieval regression from an agent regression.
+
+**At M1, set-F1 is a drift tripwire, not a quality metric.** Classes 1–4 dispatch the same `gold_query` that generated the ground truth, so with no agent choosing the query the score is 1.0 by construction. It is still worth running — it fails if a `FactsStore` query changes behaviour or the corpus is re-ingested at a different revision, which is exactly the silent-invalidation risk the next paragraph describes. It becomes a measure of the *system* only at M2, when tool selection decides which query runs and with what arguments. A reader comparing an M1 baseline to an M2 one must not read the drop as a regression, which is why §14.3 stamps the milestone on the file.
 
 **Ground truth for classes 1–4 is generated, not authored.** `evals/build_gold.py` runs the same SQL the tools run against the pinned revision and writes the resulting entity sets into the golden set. This is legitimate precisely because the query is a *fact* about the repository — but it means the scorer and the ground truth share an implementation, so a bug in the SQL would be invisible. Mitigation: the 30 structured questions are spot-checked by hand against the GitHub UI at authoring time, and that check is recorded in the file.
 
@@ -1193,12 +1197,15 @@ config_hash = hashlib.sha256(
 
 `corpus_ref` and `embedding_model` are in the hash deliberately. Comparing metrics across different corpus refs or embedding models is comparing different experiments, and the hash makes that impossible to do by accident.
 
+`corpus_ref` here is the **resolved** ref — `symbolic@sha`, the same form §14.3 records — read from the latest completed `ingest_runs` row, not the symbolic `CORPUS_REF`. Hashing the symbolic name would defeat the paragraph above: `master` hashes identically across every re-ingest, so two runs against genuinely different corpora would share a cell.
+
 ### 14.3 Baseline format
 
 `evals/baselines/main.json`:
 
 ```json
 {
+  "milestone": "M2",
   "config_hash": "a3f1c9d20e84",
   "git_sha": "…",
   "corpus_ref": "master@abc1234",
@@ -1223,6 +1230,8 @@ config_hash = hashlib.sha256(
 ```
 
 The gate fails if `current < baseline - tolerance` for any gated metric. Improvements never fail. A baseline change requires a PR that edits this file and states why in the description — so a regression cannot be silently absorbed by regenerating the baseline in the same commit that caused it.
+
+**`milestone` is part of the identity, alongside `config_hash`.** The M1 baseline carries only `aggregate_set_f1`, `recall_at_5`, and `mrr_at_10`; the M2 baseline adds `tool_accuracy_*` and `citation_resolution` and reinterprets set-F1 per §14.1. Two baselines with different milestones measure different systems and comparing them is meaningless — the same argument §14.2 makes for keeping `corpus_ref` and `embedding_model` inside the hash. A comparison across milestones is an error, not a regression.
 
 ### 14.4 Workflows
 
@@ -1284,8 +1293,9 @@ Only the LLM-judge and agent calls need network. Embeddings are local, so the re
 
 1. **Time-expression parsing.** "Last month", "since the last release", "this quarter", "recently" must resolve to a concrete range against the session's `as_of`. Options: a rules-based parser (predictable, brittle at the edges), or a structured-output Claude call (flexible, adds a round trip before the real query, and nondeterministic in a gated eval). Leaning rules-based with an explicit error on anything unrecognised, since a silently-wrong window produces a confidently-wrong status report. Undecided.
 2. **Class-6 verification: automatic or model-driven?** "Do we support websockets?" needs a merge-state check on whatever the semantic path surfaced. Either the search tool auto-joins to the facts layer and returns state alongside every chunk, or the model is expected to call `pr_state` itself. Auto-join is reliable but couples the two paths and costs on every search; model-driven is clean but will sometimes be skipped — which is exactly the PRD §5.2 failure. Probably auto-join; needs measurement.
-3. **Chunk-level vs. document-level retrieval for issues.** A long thread's resolution often sits in the last comment while the query matches the first. Parent-document expansion after fusion may beat per-comment chunks — needs an A/B at M1.
+3. **Chunk-level vs. document-level retrieval for issues.** A long thread's resolution often sits in the last comment while the query matches the first. Parent-document expansion after fusion may beat per-comment chunks — this needed an A/B at M1, and M1 measured the motivating half of it. Over the 20 interpretive questions at the pinned revision, exact chunk recall@5 is **0.350** while *parent-document* recall@5 — did the right issue thread or doc surface at all — is **0.900**. The retriever finds the right conversation and the wrong comment. q043 is the clean case: 8 of the top 10 are `issue:98` chunks, the thread the answer lives in, but the gold `issue:98#comment-0` sits at rank 17. The ranking signal is sound and the granularity is wrong, which is the strongest available argument for expansion: fuse at comment level, expand to the thread, re-rank within it. Still undecided pending the A/B, but the decision now has a number to beat — 0.350, the committed M1 baseline. Two questions (q044, q047) miss even at the parent level; both ask a general capability question whose answer sits in a specifically-titled thread, and expansion will not help them.
 4. **Aggregate truncation threshold.** At what result count does `Aggregate.rendered` stop listing entities and summarise? Too low and the model can't cite specifics; too high and a 400-PR window floods the context. Unmeasured.
 5. **Consolidation clustering threshold (0.35).** Picked by inspection, not measured. Should be swept once there is real episodic volume, with the caveat that sweeping it against the golden set is not valid — needs a held-out memory-quality rubric.
 6. **`user_profile_vector` staleness.** Cached per session; a long session that writes new semantic memories will retrieve against a stale profile. Probably immaterial at demo scale, but unverified.
 7. **Cache behavior in `semantic` mode.** Per-query tool sets sit before the cache breakpoint, so within-session cache hits may fall well short of the 60% target in that mode specifically. If measurement confirms it, the fix is moving tools after the breakpoint via mid-conversation tool changes (`mid-conversation-tool-changes-2026-07-01`) — deferred until measured.
+8. **Frontend stack for the M6 transparency view.** A React SPA or server-rendered templates. The only hard constraint is §11.2: the view is driven entirely by SSE and nothing is polled, so anything that consumes `EventSource` and holds per-turn state across memories, tools, retrieval, and citations qualifies. Deferring rather than deciding — the contract arrives at M2 and has not been exercised by a real client, and picking a stack before then would be choosing without the one piece of information that matters. PRD §5.6 and the M6 milestone are deliberately stack-agnostic and need no amendment either way. Undecided.

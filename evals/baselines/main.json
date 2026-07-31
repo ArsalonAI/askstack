@@ -1,0 +1,17 @@
+{
+  "milestone": "M1",
+  "config_hash": "d487120aa413",
+  "git_sha": "bbc427ed1b07df079d7d62651b9ea626fa0bfaa5",
+  "corpus_ref": "master@95f8322ee1dc",
+  "recorded_at": "2026-07-30T21:14:51.645780Z",
+  "metrics": {
+    "aggregate_set_f1": 1.0,
+    "recall_at_5": 0.35,
+    "mrr_at_10": 0.2317
+  },
+  "tolerances": {
+    "aggregate_set_f1": 0.02,
+    "recall_at_5": 0.02,
+    "mrr_at_10": 0.02
+  }
+}
