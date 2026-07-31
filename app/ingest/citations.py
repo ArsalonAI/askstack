@@ -111,6 +111,36 @@ def parse(raw: str) -> Citation:
     raise InvalidCitation(f"not a citation: {raw!r}")
 
 
+# Finding citations in prose is the inverse of parsing one: the model writes
+# them inline, usually in backticks because that is how `Aggregate.rendered`
+# presents them. Candidates are extracted loosely and validated by `parse`,
+# rather than being matched precisely here — the grammar already lives in one
+# place and a second, subtly different copy of it would drift.
+_CANDIDATE_RE = re.compile(
+    r"`([^`\n]+)`|(?<![\w/])((?:docs|code|issue|pr|commit|release):[^\s`,;)\]]+)"
+)
+_TRAILING = ".,;:!?)]}'\""
+
+
+def scan(text: str) -> list[Citation]:
+    """Every citation the model wrote, in order, deduplicated.
+
+    Backs the §11.2 `citation` event. Anything that does not parse is silently
+    skipped: prose containing a colon is not a malformed citation, and treating
+    it as one would flood the stream with phantom unresolved citations.
+    """
+    found: dict[str, Citation] = {}
+    for match in _CANDIDATE_RE.finditer(text):
+        raw = (match.group(1) or match.group(2) or "").strip().rstrip(_TRAILING)
+        if raw in found:
+            continue
+        try:
+            found[raw] = parse(raw)
+        except InvalidCitation:
+            continue
+    return list(found.values())
+
+
 def slugify(heading: str) -> str:
     """Heading text -> the `#slug` half of a docs citation.
 
