@@ -34,6 +34,7 @@ from app.ingest.citations import Citation, scan
 from app.interfaces import Aggregate, Entity
 from app.tools.registry import ToolOutcome, ToolRegistry
 from app.tools.selector import to_api_tools
+from app.tracing import Tracer
 
 MAX_ITERATIONS = 8  # §10
 MAX_PAUSE_RESTARTS = 3
@@ -142,6 +143,22 @@ class RefusalError(RuntimeError):
         )
 
 
+# Fields the SDK attaches to a response block that the API rejects on the way
+# back in. `messages.content` is documented as holding blocks verbatim, and it
+# does — but "verbatim" has to mean *replayable*, or turn two of every session
+# 400s on an input the model itself produced.
+SDK_ONLY_BLOCK_FIELDS = frozenset({"parsed_output"})
+
+
+def _wire_block(block) -> dict[str, Any]:
+    payload = block.model_dump(mode="json")
+    return {
+        key: value
+        for key, value in payload.items()
+        if key not in SDK_ONLY_BLOCK_FIELDS and value is not None
+    }
+
+
 def _retrieval_event(outcome: ToolOutcome) -> dict[str, Any] | None:
     """§11.2 has two `retrieval` shapes — one per substrate."""
     result = outcome.result
@@ -201,12 +218,14 @@ class Orchestrator:
         settings: Settings,
         *,
         as_of: datetime | None = None,
+        tracer=None,
     ) -> None:
         self.pool = pool
         self.registry = registry
         self.selector = selector
         self.client = client
         self.settings = settings
+        self.tracer = tracer or Tracer(settings)
         # Default to the corpus pin rather than wall-clock now: the corpus
         # cannot know anything after the revision it was ingested at, so a
         # window running past it would silently under-report.
@@ -244,17 +263,21 @@ class Orchestrator:
         next_turn = (max((r["turn"] for r in rows), default=-1)) + 1
         return messages, next_turn
 
-    async def _persist(self, session_id: str, turn: int, role: str, content) -> None:
+    async def _persist(
+        self, session_id: str, turn: int, role: str, content, trace_id: str | None = None
+    ) -> None:
         async with self.pool.acquire() as conn:
             await conn.execute(
-                "INSERT INTO messages (id, session_id, turn, role, content)"
-                " VALUES ($1, $2, $3, $4, $5)"
-                " ON CONFLICT (session_id, turn, role) DO UPDATE SET content = $5",
+                "INSERT INTO messages (id, session_id, turn, role, content, trace_id)"
+                " VALUES ($1, $2, $3, $4, $5, $6)"
+                " ON CONFLICT (session_id, turn, role) DO UPDATE SET"
+                " content = $5, trace_id = $6",
                 f"msg_{uuid.uuid4().hex[:16]}",
                 session_id,
                 turn,
                 role,
                 json.dumps(content, default=str),
+                trace_id,
             )
 
     # ------------------------------------------------------------------- loop
@@ -277,16 +300,48 @@ class Orchestrator:
             yield "error", {"code": "session_not_found", "message": "no such session"}
             return
 
+        # §12: one trace per request, its id written onto every message row so
+        # any persisted turn can be traced back to the request that produced it.
+        trace = self.tracer.trace(
+            "chat_request",
+            user_id=user_id,
+            session_id=session_id,
+            metadata={
+                "is_new_session": is_new,
+                "as_of": as_of.isoformat(),
+                "tool_mode": self.settings.tool_retrieval_mode,
+                "model": self.settings.agent_model,
+                "effort": self.settings.agent_effort,
+            },
+        )
+        trace_id = trace.id or f"trace_{uuid.uuid4().hex[:16]}"
+
         yield "session", {
             "session_id": session_id,
-            "trace_id": f"trace_{uuid.uuid4().hex[:16]}",
+            "trace_id": trace_id,
             "is_new": is_new,
         }
 
         history, turn = await self._history(session_id)
-        await self._persist(session_id, turn, "user", message)
+        await self._persist(session_id, turn, "user", message, trace_id)
 
-        selected = await self.selector.select(message, self.settings.tool_retrieval_k)
+        with trace.span(
+            "tools.select",
+            metadata={
+                "mode": self.selector.mode,
+                "k": self.settings.tool_retrieval_k,
+                "floor": self.settings.tool_similarity_floor,
+            },
+        ) as span:
+            selected = await self.selector.select(message, self.settings.tool_retrieval_k)
+            span.update(
+                metadata={
+                    "selected": [t.name for t in selected],
+                    "scores": [round(t.score, 6) for t in selected],
+                    "n_synthetic": sum(t.is_synthetic for t in selected),
+                }
+            )
+
         yield "tools_selected", {
             "mode": self.selector.mode,
             "catalog_size": len(self.registry.definitions()),
@@ -330,76 +385,118 @@ class Orchestrator:
 
         assistant_blocks: list[Any] = []
         pauses = 0
+        iterations = 0
+        stop_reason = None
 
         try:
-            for _ in range(MAX_ITERATIONS):
-                text_this_step = ""
-                async with self.client.beta.messages.stream(
-                    **request, messages=messages
-                ) as stream:
-                    async for event in stream:
-                        if (
-                            event.type == "content_block_delta"
-                            and event.delta.type == "text_delta"
-                        ):
-                            text_this_step += event.delta.text
-                            yield "token", {"text": event.delta.text}
-                    response = await stream.get_final_message()
+            with trace.span("agent.loop") as loop_span:
+                for _ in range(MAX_ITERATIONS):
+                    iterations += 1
+                    text_this_step = ""
+                    with trace.generation(
+                        "llm.generate",
+                        model=self.settings.agent_model,
+                        metadata={"effort": self.settings.agent_effort, "iteration": iterations},
+                    ) as generation:
+                        async with self.client.beta.messages.stream(
+                            **request, messages=messages
+                        ) as stream:
+                            async for event in stream:
+                                if (
+                                    event.type == "content_block_delta"
+                                    and event.delta.type == "text_delta"
+                                ):
+                                    text_this_step += event.delta.text
+                                    yield "token", {"text": event.delta.text}
+                            response = await stream.get_final_message()
+                        usage = response.usage
+                        generation.update(
+                            usage={
+                                "input": getattr(usage, "input_tokens", 0),
+                                "output": getattr(usage, "output_tokens", 0),
+                            },
+                            metadata={
+                                "stop_reason": response.stop_reason,
+                                # The §9 caching claim is only credible if it is
+                                # visible per call, not just asserted once in a test.
+                                "cache_read_input_tokens": getattr(
+                                    usage, "cache_read_input_tokens", 0
+                                ),
+                                "cache_creation_input_tokens": getattr(
+                                    usage, "cache_creation_input_tokens", 0
+                                ),
+                            },
+                        )
 
-                turn_state.add_usage(response.usage)
+                    stop_reason = response.stop_reason
+                    turn_state.add_usage(response.usage)
 
-                # Check stop_reason before reading content — a refusal carries
-                # empty or partial content, and indexing it would break (§10).
-                if response.stop_reason == "refusal":
-                    raise RefusalError(getattr(response, "stop_details", None))
+                    # Check stop_reason before reading content — a refusal carries
+                    # empty or partial content, and indexing it would break (§10).
+                    if response.stop_reason == "refusal":
+                        raise RefusalError(getattr(response, "stop_details", None))
 
-                for citation in scan(text_this_step):
-                    if event_data := await self._citation_event(citation, turn_state):
-                        yield "citation", event_data
+                    for citation in scan(text_this_step):
+                        if event_data := await self._citation_event(citation, turn_state):
+                            yield "citation", event_data
 
-                assistant_blocks.extend(response.content)
-                messages = [*messages, {"role": "assistant", "content": response.content}]
+                    assistant_blocks.extend(response.content)
+                    messages = [*messages, {"role": "assistant", "content": response.content}]
 
-                if response.stop_reason == "pause_turn":
-                    # A server-side tool hit its iteration cap. Re-sending
-                    # resumes it; an unhandled pause silently truncates.
-                    pauses += 1
-                    if pauses > MAX_PAUSE_RESTARTS:
+                    if response.stop_reason == "pause_turn":
+                        # A server-side tool hit its iteration cap. Re-sending
+                        # resumes it; an unhandled pause silently truncates.
+                        pauses += 1
+                        if pauses > MAX_PAUSE_RESTARTS:
+                            break
+                        continue
+
+                    tool_uses = [b for b in response.content if b.type == "tool_use"]
+                    if not tool_uses:
                         break
-                    continue
 
-                tool_uses = [b for b in response.content if b.type == "tool_use"]
-                if not tool_uses:
-                    break
-
-                results = []
-                for block in tool_uses:
-                    yield "tool_call", {
-                        "name": block.name,
-                        "input": block.input,
-                        "status": "started",
-                    }
-                    outcome = await self.registry.dispatch(
-                        block.name, dict(block.input), as_of=as_of
-                    )
-                    turn_state.record(outcome)
-                    yield "tool_call", {
-                        "name": block.name,
-                        "input": block.input,
-                        "status": "error" if outcome.is_error else "ok",
-                        "duration_ms": outcome.duration_ms,
-                    }
-                    if payload := _retrieval_event(outcome):
-                        yield "retrieval", payload
-                    results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": outcome.rendered,
-                            "is_error": outcome.is_error,
+                    results = []
+                    for block in tool_uses:
+                        yield "tool_call", {
+                            "name": block.name,
+                            "input": block.input,
+                            "status": "started",
                         }
-                    )
-                messages = [*messages, {"role": "user", "content": results}]
+                        with trace.span(
+                            f"tool.call.{block.name}", input=dict(block.input)
+                        ) as tool_span:
+                            outcome = await self.registry.dispatch(
+                                block.name, dict(block.input), as_of=as_of, trace=trace
+                            )
+                            tool_span.update(
+                                metadata={
+                                    "duration_ms": outcome.duration_ms,
+                                    "is_error": outcome.is_error,
+                                    "is_synthetic": False,
+                                }
+                            )
+                        turn_state.record(outcome)
+                        yield "tool_call", {
+                            "name": block.name,
+                            "input": block.input,
+                            "status": "error" if outcome.is_error else "ok",
+                            "duration_ms": outcome.duration_ms,
+                        }
+                        if payload := _retrieval_event(outcome):
+                            yield "retrieval", payload
+                        results.append(
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": outcome.rendered,
+                                "is_error": outcome.is_error,
+                            }
+                        )
+                    messages = [*messages, {"role": "user", "content": results}]
+
+                loop_span.update(
+                    metadata={"n_iterations": iterations, "stop_reason": stop_reason}
+                )
 
         except RefusalError as exc:
             yield "error", {"code": "refusal", "message": str(exc)}
@@ -409,15 +506,24 @@ class Orchestrator:
             return
 
         await self._persist(
-            session_id, turn, "assistant", [b.model_dump() for b in assistant_blocks]
+            session_id,
+            turn,
+            "assistant",
+            [_wire_block(b) for b in assistant_blocks],
+            trace_id,
         )
 
-        yield "done", {
+        done = {
             "turn": turn,
             "usage": turn_state.usage,
             "cost_usd": turn_state.cost_usd,
             "latency_ms": int((time.monotonic() - started) * 1000),
         }
+        trace.update(output=done)
+        # Langfuse batches on a background thread; a request that returns before
+        # the queue drains loses its trace in a short-lived process.
+        self.tracer.flush()
+        yield "done", done
 
     # -------------------------------------------------------------- citations
 

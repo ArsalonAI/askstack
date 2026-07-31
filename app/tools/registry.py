@@ -288,7 +288,12 @@ class ToolRegistry:
         return resolve(expression, as_of)
 
     async def dispatch(
-        self, name: str, arguments: dict[str, Any], *, as_of: datetime | None = None
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        as_of: datetime | None = None,
+        trace=None,
     ) -> ToolOutcome:
         started = time.monotonic()
         as_of = as_of or datetime.now(UTC)
@@ -307,7 +312,7 @@ class ToolRegistry:
             return done(f"No tool named {name!r}.", is_error=True)
 
         try:
-            return done(*await self._call(name, arguments, as_of))
+            return done(*await self._call(name, arguments, as_of, trace))
         except UnresolvableWindow as exc:
             # §6.4: an unresolvable expression is a tool error, never a guess.
             return done(str(exc), is_error=True)
@@ -319,7 +324,7 @@ class ToolRegistry:
         except (ValueError, KeyError) as exc:
             return done(f"{name} failed: {exc}", is_error=True)
 
-    async def _call(self, name: str, args: dict[str, Any], as_of: datetime):
+    async def _call(self, name: str, args: dict[str, Any], as_of: datetime, trace=None):
         if name == "merged_prs":
             since, until = await self._window(args["window"], as_of)
             aggregate = await self.facts.merged_prs(since, until, args.get("area"))
@@ -358,5 +363,7 @@ class ToolRegistry:
             return _render_entity(label, ref, entity), entity
 
         source = SEARCH_SOURCES[name]
-        chunks = await self.retriever.search(args["query"], self.top_k, sources=[source])
+        chunks = await self.retriever.search(
+            args["query"], self.top_k, sources=[source], trace=trace
+        )
         return _render_chunks(chunks), chunks

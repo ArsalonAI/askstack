@@ -126,7 +126,14 @@ class Retriever(Protocol):
         query: str,
         k: int,
         sources: Sequence[Source] | None = None,
-    ) -> list[Chunk]: ...
+        trace: object | None = None,
+    ) -> list[Chunk]:
+        """`trace` is the §12 span parent for the `retrieve.*` sub-spans.
+
+        Optional and defaulted: §14.4 requires retrieval metrics to be
+        reproducible with no network at all, so an implementation must run
+        without an observability backend attached.
+        """
 
 
 class FactsStore(Protocol):

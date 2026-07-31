@@ -62,7 +62,7 @@ class StubRetriever:
         self.calls: list[tuple] = []
         self._chunks = chunks or []
 
-    async def search(self, query, k, sources=None):
+    async def search(self, query, k, sources=None, trace=None):
         self.calls.append((query, k, tuple(sources or ())))
         return self._chunks
 
