@@ -24,15 +24,9 @@ from app.orchestrator import Orchestrator, sse
 from app.retrieval.embedder import get_embedder
 from app.retrieval.hybrid import HybridRetriever
 from app.tools.registry import CATALOG, ToolRegistry
-from app.tools.selector import FullToolSelector
+from app.tools.selector import build_selector
 
 log = logging.getLogger(__name__)
-
-# Ablation axis C. Modes are added here as they land; an unimplemented mode
-# fails loudly rather than falling back, because a run that reports `semantic`
-# in its config hash while actually broadcasting every tool would poison the
-# comparison the whole thesis rests on (§7.3).
-SELECTORS = {"full": FullToolSelector}
 
 
 class ChatRequest(BaseModel):
@@ -82,16 +76,17 @@ def _orchestrator(as_of: datetime | None = None) -> Orchestrator:
     registry = ToolRegistry(
         PostgresFactsStore(pool), retriever, top_k=settings.retrieval_top_k
     )
-    if settings.tool_retrieval_mode not in SELECTORS:
-        raise NotImplementedError(
-            f"TOOL_RETRIEVAL_MODE={settings.tool_retrieval_mode!r} is not implemented "
-            f"yet. Available: {', '.join(sorted(SELECTORS))}."
-        )
-    selector_cls = SELECTORS[settings.tool_retrieval_mode]
+    selector = build_selector(
+        settings.tool_retrieval_mode,
+        CATALOG,
+        pool=pool,
+        embedder=app.state.embedder,
+        floor=settings.tool_similarity_floor,
+    )
     return Orchestrator(
         pool,
         registry,
-        selector_cls(CATALOG),
+        selector,
         app.state.client,
         settings,
         as_of=as_of or app.state.as_of,

@@ -298,6 +298,13 @@ class Orchestrator:
         }
 
         messages = [*history, {"role": "user", "content": message}]
+        # `native` mode contributes deferred flags and the provider's own
+        # tool-search tool. Merged explicitly rather than splatted, so a mode
+        # cannot silently overwrite the `tools` the selector just chose.
+        extra = dict(self.selector.extra_request_params())
+        api_tools = to_api_tools(selected, deferred=extra.pop("defer", ()))
+        api_tools += extra.pop("extra_tools", [])
+
         request = {
             "model": self.settings.agent_model,
             "max_tokens": MAX_TOKENS,
@@ -312,13 +319,13 @@ class Orchestrator:
                     "cache_control": {"type": "ephemeral"},
                 }
             ],
-            "tools": to_api_tools(selected),
+            "tools": api_tools,
             "betas": [FALLBACK_BETA],
             # A corpus of security-adjacent issue threads will trip the
             # classifiers eventually; degrade to another model rather than
             # failing the request (§10).
             "fallbacks": "default",
-            **self.selector.extra_request_params(),
+            **extra,
         }
 
         assistant_blocks: list[Any] = []
