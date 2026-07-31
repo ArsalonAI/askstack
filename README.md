@@ -34,7 +34,41 @@ Point `DATABASE_URL` at it and run the migration as above. `pytest` uses a separ
 
 </details>
 
-Ingest and the service arrive with M0/M2 — see the milestone table in the PRD.
+## Running it
+
+Ingest the corpus, embed the tool catalog, then start the service:
+
+```bash
+python scripts/ingest.py                  # ~30 min cold; re-runs skip unchanged chunks
+python scripts/seed_tools.py              # tool embeddings for semantic selection
+uv run uvicorn app.main:app               # http://localhost:8000
+```
+
+Ask it something. The response is an SSE stream, not JSON — every step of the
+turn is an event, and the transparency view (PRD §5.6) is built on them:
+
+```bash
+curl -N localhost:8000/chat -H 'content-type: application/json' \
+  -d '{"user_id":"you","session_id":null,"message":"Did pull request 15806 ship?"}'
+```
+
+`GET /healthz` reports what is actually reachable — corpus size, the pinned
+revision every answer is dated against, whether a model key and Langfuse are
+configured.
+
+## Evaluating
+
+```bash
+python evals/build_gold.py --check        # ground truth still reproduces from the pin
+python evals/runner.py                    # retrieval only: no model, no network, no key
+python evals/runner.py --agent            # the full agent turn; costs money
+python evals/runner.py --question q033 --explain
+```
+
+The two paths are deliberate. `--agent` measures the system a user meets and is
+what the committed baseline gates on; the default path calls the retriever and
+the facts layer directly, so a regression there is visible without an agent run
+in the way. See TRD §14.1.
 
 ## Layout
 

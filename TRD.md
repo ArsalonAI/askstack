@@ -1239,6 +1239,8 @@ config_hash = hashlib.sha256(
 
 The gate fails if `current < baseline - tolerance` for any gated metric. Improvements never fail. A baseline change requires a PR that edits this file and states why in the description — so a regression cannot be silently absorbed by regenerating the baseline in the same commit that caused it.
 
+**Two baseline files, because §14.1 keeps both runner shapes.** `main.json` is the agent path — the system a user meets, and what the gate compares against. `retrieval.json` is the direct-call path at the same corpus and embedding model, carrying only the three retrieval metrics. When a number moves, the pair says where: both moving is retrieval, `main.json` alone moving is the agent, prompt, or tool layer. One file cannot distinguish those, and at M2 the agent is the noisier of the two.
+
 **`milestone` is part of the identity, alongside `config_hash`.** The M1 baseline carries only `aggregate_set_f1`, `recall_at_5`, and `mrr_at_10`; the M2 baseline adds `tool_accuracy_*` and `citation_resolution` and reinterprets set-F1 per §14.1. Two baselines with different milestones measure different systems and comparing them is meaningless — the same argument §14.2 makes for keeping `corpus_ref` and `embedding_model` inside the hash. A comparison across milestones is an error, not a regression.
 
 ### 14.4 Workflows

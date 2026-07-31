@@ -35,6 +35,15 @@ class BGEEmbedder:
         self.model_id = model_id or settings.embedding_model
         self._model = None
         self._lock = threading.Lock()
+        # Inference is serialised, not just loading. §2.3 called the model
+        # "thread-safe for inference"; it is not. Concurrent `encode` calls
+        # from several `asyncio.to_thread` workers — which is exactly what one
+        # request does, since the dense arm and the tool selector both embed,
+        # times the concurrent sessions §13 requires — segfault the process.
+        # A crash, not an exception: nothing to catch, nothing in the logs.
+        # Encoding a short query is single-digit milliseconds, so the lock
+        # costs far less than the concurrency it protects.
+        self._inference_lock = threading.Lock()
 
     @property
     def model(self):
@@ -57,13 +66,15 @@ class BGEEmbedder:
         """(n, dim) float32, L2-normalized. No query prefix — these are passages."""
         if not texts:
             return np.zeros((0, self.dim), dtype=np.float32)
-        vectors = self.model.encode(
-            list(texts),
-            batch_size=BATCH_SIZE,
-            normalize_embeddings=True,
-            convert_to_numpy=True,
-            show_progress_bar=False,
-        )
+        model = self.model  # load outside the inference lock
+        with self._inference_lock:
+            vectors = model.encode(
+                list(texts),
+                batch_size=BATCH_SIZE,
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+            )
         return vectors.astype(np.float32, copy=False)
 
     def embed_query(self, text: str) -> np.ndarray:

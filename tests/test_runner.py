@@ -5,7 +5,7 @@ is deliberate: these are the numbers CI gates on, and a scorer bug would be
 invisible behind a plausible-looking metric.
 """
 
-from evals.runner import mrr_at_k, recall_at_k, set_f1
+from evals.runner import jaccard, mrr_at_k, recall_at_k, set_f1
 
 
 class TestSetF1:
@@ -50,6 +50,27 @@ class TestRecallAtK:
         # a malformed question, not a legitimate empty answer. build_gold's
         # validate rejects it; this only guarantees no ZeroDivisionError.
         assert recall_at_k(["a"], [], k=5) == 0.0
+
+
+class TestJaccard:
+    """Tool-selection accuracy — §14.1. Jaccard rather than exact match is what
+    degrades gracefully when the selector returns k tools and gold names one."""
+
+    def test_identical_sets(self):
+        assert jaccard({"pr_state"}, {"pr_state"}) == 1.0
+
+    def test_disjoint_sets(self):
+        assert jaccard({"pr_state"}, {"merged_prs"}) == 0.0
+
+    def test_gold_present_among_extras(self):
+        # The shape of every `semantic` result: 1 gold tool inside 5 selected.
+        assert jaccard({"a", "b", "c", "d", "e"}, {"a"}) == 0.2
+
+    def test_both_empty_is_perfect(self):
+        assert jaccard(set(), set()) == 1.0
+
+    def test_empty_prediction_against_gold(self):
+        assert jaccard(set(), {"pr_state"}) == 0.0
 
 
 class TestMRRAtK:
