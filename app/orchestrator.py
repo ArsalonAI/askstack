@@ -165,6 +165,12 @@ def _retrieval_event(outcome: ToolOutcome) -> dict[str, Any] | None:
     if isinstance(result, list):
         return {
             "kind": "semantic",
+            # Both shapes name their tool. The structured one always did; this
+            # one did not, which made a turn's retrievals unattributable once a
+            # consumer had merged them — see §14.1, which scores the retrieval
+            # whose tool the question asked for, and §5.6's view, which has to
+            # say which tool produced a result to be a transparency view at all.
+            "tool": outcome.name,
             "query": outcome.input.get("query", ""),
             "chunks": [
                 {

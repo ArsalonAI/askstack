@@ -5,7 +5,17 @@ is deliberate: these are the numbers CI gates on, and a scorer bug would be
 invisible behind a plausible-looking metric.
 """
 
-from evals.runner import jaccard, mrr_at_k, recall_at_k, set_f1
+import json
+
+from evals.runner import (
+    CACHE_FORMAT,
+    _load_cache,
+    gold_tool_entities,
+    jaccard,
+    mrr_at_k,
+    recall_at_k,
+    set_f1,
+)
 
 
 class TestSetF1:
@@ -34,6 +44,92 @@ class TestSetF1:
 
     def test_duplicates_do_not_inflate(self):
         assert set_f1(["pr:1", "pr:1"], ["pr:1"]) == 1.0
+
+
+class TestGoldToolEntities:
+    """§14.1 — which of a turn's retrievals set-F1 is scored over.
+
+    The union reading these replace measured tool-call count: q006 lost a third
+    of its score for performing the §5.2 verification the PRD requires.
+    """
+
+    def test_only_the_gold_tool_counts(self):
+        retrievals = [
+            {"tool": "pr_state", "entities": ["pr:15806"]},
+            {"tool": "merged_prs", "entities": [f"pr:{n}" for n in range(500)]},
+        ]
+        assert gold_tool_entities(retrievals, {"pr_state"}) == ["pr:15806"]
+
+    def test_verification_lookups_are_free(self):
+        """q006's shape: check the PR, then separately confirm the release."""
+        retrievals = [
+            {"tool": "pr_state", "entities": ["pr:15806"]},
+            {"tool": "release_info", "entities": ["release:0.138.0"]},
+        ]
+        predicted = gold_tool_entities(retrievals, {"pr_state"})
+        assert set_f1(predicted, ["pr:15806"]) == 1.0
+
+    def test_one_tool_called_twice_contributes_both(self):
+        """Two windows is one tool used twice — not a tool-count artefact."""
+        retrievals = [
+            {"tool": "merged_prs", "entities": ["pr:1"]},
+            {"tool": "merged_prs", "entities": ["pr:2"]},
+        ]
+        assert gold_tool_entities(retrievals, {"merged_prs"}) == ["pr:1", "pr:2"]
+
+    def test_deduplicates_across_calls(self):
+        retrievals = [
+            {"tool": "merged_prs", "entities": ["pr:1", "pr:2"]},
+            {"tool": "merged_prs", "entities": ["pr:2", "pr:3"]},
+        ]
+        assert gold_tool_entities(retrievals, {"merged_prs"}) == ["pr:1", "pr:2", "pr:3"]
+
+    def test_never_calling_the_gold_tool_scores_zero(self):
+        """q005 called nothing at all. An agent that never ran the right query
+        did not answer the question, however good its prose."""
+        retrievals = [{"tool": "merged_prs", "entities": ["pr:1"]}]
+        predicted = gold_tool_entities(retrievals, {"issue_state"})
+        assert predicted == []
+        assert set_f1(predicted, ["issue:11143"]) == 0.0
+
+    def test_no_retrievals_at_all(self):
+        assert gold_tool_entities([], {"pr_state"}) == []
+
+
+class TestCacheFormat:
+    """A cached row is a *scored* row, so it belongs to one scorer version."""
+
+    def _row(self, qid, **over):
+        row = {
+            "cache_format": CACHE_FORMAT,
+            "qid": qid,
+            "klass": 1,
+            "metrics": {"set_f1": 1.0},
+            "predicted": ["pr:1"],
+            "gold": ["pr:1"],
+            "agent": {"retrievals": [], "error": None},
+        }
+        return {**row, **over}
+
+    def test_current_rows_load(self, tmp_path):
+        path = tmp_path / "c.jsonl"
+        path.write_text(json.dumps(self._row("q001")) + "\n")
+        assert set(_load_cache(path)) == {"q001"}
+
+    def test_rows_from_an_older_scorer_are_dropped(self, tmp_path):
+        """Replaying a union-scored row beside a gold-tool-scored one would
+        average a baseline half-computed each way, with nothing saying so."""
+        path = tmp_path / "c.jsonl"
+        path.write_text(
+            json.dumps(self._row("q001", cache_format=CACHE_FORMAT - 1)) + "\n"
+            + json.dumps({k: v for k, v in self._row("q002").items()
+                          if k != "cache_format"}) + "\n"
+            + json.dumps(self._row("q003")) + "\n"
+        )
+        assert set(_load_cache(path)) == {"q003"}
+
+    def test_missing_file_is_empty_not_an_error(self, tmp_path):
+        assert _load_cache(tmp_path / "nope.jsonl") == {}
 
 
 class TestRecallAtK:

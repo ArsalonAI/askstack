@@ -124,6 +124,17 @@ class TestRetrievalEvent:
         assert event["chunks"][0]["citation"] == "issue:98#comment-0"
         assert event["chunks"][0]["score"] == pytest.approx(0.42)
 
+    def test_both_shapes_name_their_tool(self):
+        """§11.2. Without this a turn's retrievals are unattributable once a
+        consumer merges them — which is what §14.1 scores and what PRD §5.6's
+        view has to show."""
+        for produced in (
+            outcome("search_issues", [chunk()]),
+            outcome("merged_prs", aggregate([entity()])),
+            outcome("pr_state", entity()),
+        ):
+            assert _retrieval_event(produced)["tool"] == produced.name
+
     def test_a_single_entity_still_emits_an_event(self):
         """`pr_state` is how §5.2 verification happens; a turn that verified
         and emitted nothing would score as never having checked."""

@@ -71,6 +71,11 @@ TOLERANCES = {
     "citation_resolution": 0.01,
 }
 
+# Bumped whenever a scoring rule changes, which invalidates every cached row
+# written under the old one. `2` is §14.1's gold-tool-matched set-F1 replacing
+# the union — see §17 Q10.
+CACHE_FORMAT = 2
+
 RECALL_K = 5
 MRR_K = 10
 # Retrieve enough for the deepest metric; recall@5 is a prefix of the same list.
@@ -162,6 +167,35 @@ def jaccard(got: set[str], want: set[str]) -> float:
     return len(got & want) / len(union) if union else 0.0
 
 
+def gold_tool_entities(
+    retrievals: list[dict], gold_tools: set[str]
+) -> list[str]:
+    """The entities retrieved by the tool the question asks for — §14.1.
+
+    Scored over the retrieval whose tool is in `gold_tools`, not over the union
+    of the turn. The union measures how many tools the agent called: with it,
+    q006 scored 0.667 for checking `pr:15806` and then separately confirming
+    `release:0.138.0` had shipped, which is exactly the verification PRD §5.2
+    requires. A metric that penalises that is measuring the wrong thing.
+
+    A tool called more than once contributes all its calls — the agent may
+    legitimately need two windows — because those are the *same* tool and so
+    cannot be a tool-count artefact.
+
+    No matching retrieval yields `[]`, which scores 0.0 against a non-empty
+    gold set. That is the intended reading: an agent that never called the
+    right tool did not answer the question, however good its prose was.
+    """
+    return list(
+        dict.fromkeys(
+            citation
+            for r in retrievals
+            if r["tool"] in gold_tools
+            for citation in r["entities"]
+        )
+    )
+
+
 async def score_agent(orchestrator, question: dict, gold_entities: list[str]) -> Result:
     """One agent turn, scored off the SSE events — §14.1 at M2.
 
@@ -174,7 +208,11 @@ async def score_agent(orchestrator, question: dict, gold_entities: list[str]) ->
     as_of = as_datetime(question["as_of"])
 
     selected: list[str] = []
-    entities: list[str] = []
+    # Per-retrieval rather than flattened, because §14.1 scores the retrieval
+    # whose tool matches and the union is no longer recoverable once merged.
+    # Kept in the cache so a later reading can be compared without re-running
+    # fifty paid turns to get the breakdown back.
+    retrievals: list[dict] = []
     chunks: list[str] = []
     citations: list[dict] = []
     tool_calls: list[str] = []
@@ -188,7 +226,12 @@ async def score_agent(orchestrator, question: dict, gold_entities: list[str]) ->
             selected = [t["name"] for t in data["selected"]]
         elif event == "retrieval":
             if data["kind"] == "structured":
-                entities.extend(e["citation"] for e in data["entities"])
+                retrievals.append(
+                    {
+                        "tool": data["tool"],
+                        "entities": [e["citation"] for e in data["entities"]],
+                    }
+                )
             else:
                 chunks.extend(c["citation"] for c in data["chunks"])
         elif event == "citation":
@@ -213,9 +256,14 @@ async def score_agent(orchestrator, question: dict, gold_entities: list[str]) ->
         ) / len(citations)
 
     if klass in EXACT_CLASSES:
-        # De-duplicated in call order; the agent may call a tool twice.
-        predicted = list(dict.fromkeys(entities))
+        predicted = gold_tool_entities(retrievals, gold_tools)
         metrics["set_f1"] = set_f1(predicted, gold_entities)
+        # Reported, never gated. §17 Q10 is settled but its evidence should stay
+        # visible: when the two diverge the agent made calls beyond the one the
+        # question asked for, which is worth seeing even though it no longer
+        # costs anything.
+        union = list(dict.fromkeys(c for r in retrievals for c in r["entities"]))
+        metrics["set_f1_union"] = set_f1(union, gold_entities)
         gold = gold_entities
     else:
         predicted = list(dict.fromkeys(chunks))
@@ -233,6 +281,7 @@ async def score_agent(orchestrator, question: dict, gold_entities: list[str]) ->
             "selected": selected,
             "called": tool_calls,
             "gold_tools": sorted(gold_tools),
+            "retrievals": retrievals,
             "citations": citations,
             "error": error,
             "usage": usage,
@@ -241,13 +290,24 @@ async def score_agent(orchestrator, question: dict, gold_entities: list[str]) ->
 
 
 def _load_cache(path: Path) -> dict[str, Result]:
+    """Reusable results only. A row from an older scorer is not one.
+
+    `predicted` and `metrics` are stored already-scored, so a row written before
+    a scoring change would be replayed under the old definition and averaged in
+    beside freshly-scored ones — a baseline half-computed each way, with nothing
+    in the output to say so. Stale rows are dropped and re-run instead; the cost
+    of re-running them is the price of the change, and it is visible.
+    """
     if not path.is_file():
         return {}
-    cached = {}
+    cached, stale = {}, 0
     for line in path.read_text().splitlines():
         if not line.strip():
             continue
         row = json.loads(line)
+        if row.get("cache_format") != CACHE_FORMAT:
+            stale += 1
+            continue
         cached[row["qid"]] = Result(
             qid=row["qid"],
             klass=row["klass"],
@@ -255,6 +315,12 @@ def _load_cache(path: Path) -> dict[str, Result]:
             predicted=row["predicted"],
             gold=row["gold"],
             agent=row["agent"],
+        )
+    if stale:
+        print(
+            f"  discarding {stale} cached result(s) from an older scorer "
+            f"(cache_format != {CACHE_FORMAT}); they will be re-run",
+            file=sys.stderr,
         )
     return cached
 
@@ -336,6 +402,7 @@ async def run_agent_path(
                     handle.write(
                         json.dumps(
                             {
+                                "cache_format": CACHE_FORMAT,
                                 "qid": result.qid,
                                 "klass": result.klass,
                                 "metrics": result.metrics,
@@ -380,8 +447,11 @@ def aggregate(results: list[Result]) -> dict[str, float]:
         "recall_at_5": _mean([r.metrics["recall_at_5"] for r in interp]),
         "mrr_at_10": _mean([r.metrics["mrr_at_10"] for r in interp]),
     }
-    # The three agent-turn metrics exist only on the M2 path (§14.1).
+    # The agent-turn metrics exist only on the M2 path (§14.1).
+    # `aggregate_set_f1_union` carries no tolerance and so never reaches the
+    # gate — it is the §17 Q10 diagnostic, not a second headline number.
     for key, source in (
+        ("aggregate_set_f1_union", "set_f1_union"),
         ("tool_accuracy_jaccard", "tool_jaccard"),
         ("tool_accuracy_exact", "tool_exact"),
         ("citation_resolution", "citation_resolution"),
@@ -443,6 +513,24 @@ def report(
     for key in ("tool_accuracy_jaccard", "tool_accuracy_exact", "citation_resolution"):
         if key in metrics:
             print(f"  {key:<21} {metrics[key]:.3f}")
+    if "aggregate_set_f1_union" in metrics:
+        union = metrics["aggregate_set_f1_union"]
+        print(
+            f"\n  set-F1 over the union of the turn  {union:.3f}   "
+            f"(report-only — §17 Q10)"
+        )
+        if union < metrics["aggregate_set_f1"]:
+            extra = [
+                r
+                for r in results
+                if r.klass in EXACT_CLASSES
+                and r.metrics.get("set_f1_union", 1.0) < r.metrics["set_f1"]
+            ]
+            print(
+                f"  {len(extra)} question(s) retrieved beyond the tool asked for: "
+                f"{', '.join(r.qid for r in extra[:8])}"
+                f"{'...' if len(extra) > 8 else ''}"
+            )
 
     if not agent:
         # Structural 1.0 is expected on the M1 path; anything less means the
