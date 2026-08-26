@@ -205,3 +205,37 @@ class TestHarnessBounds:
         """One turn means memory resolved it; two means it had to be told.
         A bound below 2 could never observe the difference."""
         assert MAX_TURNS >= 2
+
+
+class TestReportRefusesErroredRuns:
+    """An errored arm is not a measured arm.
+
+    This run exhausted its credit balance partway through: every memory-on
+    scenario errored, and the harness wrote a report recording task_success
+    0.00 for `on` against 1.00 for `off` — a file asserting that memory made
+    the system strictly worse, caused entirely by billing. `evals/runner.py`
+    already refused to write a baseline under exactly these conditions; the
+    guard had simply not been carried across.
+    """
+
+    def test_an_errored_scenario_is_visible_on_the_result(self):
+        errored = scenario_result("on", succeeded=False)
+        errored.sessions[0].turns[0].error = {"code": "upstream_unavailable"}
+        assert errored.error is not None
+
+    def test_error_is_none_on_a_clean_run(self):
+        assert scenario_result("on", succeeded=True, turns=1).error is None
+
+    def test_a_failed_task_is_not_an_errored_one(self):
+        """The distinction the guard rests on: an agent that ran and did not
+        do the task is a measurement; an agent that never reached the model is
+        not."""
+        missed = scenario_result("off", succeeded=False)
+        assert missed.error is None
+
+    def test_errored_scenarios_are_counted_per_arm(self):
+        errored = scenario_result("on", succeeded=False)
+        errored.sessions[0].turns[0].error = {"code": "upstream_unavailable"}
+        arms = report([errored, scenario_result("off", succeeded=True, turns=2)])
+        assert arms["on"]["errored"] == 1
+        assert arms["off"]["errored"] == 0

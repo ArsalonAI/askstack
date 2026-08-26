@@ -520,6 +520,26 @@ async def main(argv: list[str] | None = None) -> int:
     print_report(results, metrics)
 
     if args.json:
+        # The same guard `evals/runner.py` already has, and for the same reason
+        # — learned twice because it was not carried across.
+        #
+        # An errored scenario is not a failed scenario. When this run exhausted
+        # its credit balance partway through, every memory-on scenario errored
+        # and the report recorded task_success 0.00 for `on` against 1.00 for
+        # `off`: a file saying memory made the system strictly worse, caused
+        # entirely by billing. Committed, it would have been the headline
+        # number for the architecture this project exists to test.
+        failed = [r for r in results if r.error]
+        if failed:
+            print(
+                f"\nrefusing to write a report: {len(failed)} scenario(s) errored "
+                f"({', '.join(f'{r.scenario_id}/{r.arm}' for r in failed[:5])}"
+                f"{'...' if len(failed) > 5 else ''}).\n"
+                "An errored arm is not a measured arm — writing this would "
+                "record an infrastructure failure as an architectural result.",
+                file=sys.stderr,
+            )
+            return 1
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(
             json.dumps(
