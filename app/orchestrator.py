@@ -160,6 +160,36 @@ def _wire_block(block) -> dict[str, Any]:
     }
 
 
+# What survives into replayed history. An allowlist rather than a denylist,
+# because the two block types that break replay break it for *opposite*
+# reasons and a denylist gets one of them wrong:
+#
+#   `tool_use` is only valid immediately followed by its `tool_result`, and
+#   results are not persisted as messages — they belong to the turn that
+#   produced them, not to the conversation. Replaying one alone is a 400 on
+#   every second turn that called a tool.
+#
+#   `thinking` may not be *modified* once emitted. Dropping a `tool_use` from
+#   a message that also thought is itself a modification, so removing one
+#   without the other trades a paired-block error for a thinking-block error.
+#
+# Text is what a conversation is. The rows still hold every block verbatim
+# (§4) — this filter is on the read side, so the transcript stays a complete
+# record of what the model emitted while the replayed conversation stays valid.
+REPLAYABLE_BLOCKS = frozenset({"text"})
+
+
+def replayable(content: Any) -> Any:
+    """One stored message's content, safe to send back as history."""
+    if not isinstance(content, list):
+        return content
+    return [
+        block
+        for block in content
+        if not isinstance(block, dict) or block.get("type") in REPLAYABLE_BLOCKS
+    ]
+
+
 def _retrieval_event(outcome: ToolOutcome) -> dict[str, Any] | None:
     """§11.2 has two `retrieval` shapes — one per substrate."""
     # Memory is neither substrate. `memory_search` returns rows about the user,
@@ -274,11 +304,17 @@ class Orchestrator:
                 " WHERE session_id = $1 ORDER BY turn, role",
                 session_id,
             )
-        messages = [
-            {"role": r["role"], "content": json.loads(r["content"])}
-            for r in rows
-            if r["role"] in ("user", "assistant")
-        ]
+        messages = []
+        for row in rows:
+            if row["role"] not in ("user", "assistant"):
+                continue
+            content = replayable(json.loads(row["content"]))
+            # An assistant turn that only called tools leaves nothing behind
+            # once its `tool_use` blocks are dropped, and an empty content
+            # array is itself a 400. Skip the message rather than send it.
+            if isinstance(content, list) and not content:
+                continue
+            messages.append({"role": row["role"], "content": content})
         next_turn = (max((r["turn"] for r in rows), default=-1)) + 1
         return messages, next_turn
 

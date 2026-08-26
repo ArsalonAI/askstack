@@ -17,6 +17,7 @@ from app.orchestrator import (
     Turn,
     _retrieval_event,
     _wire_block,
+    replayable,
     sse,
 )
 from app.tools.registry import ToolOutcome
@@ -219,3 +220,50 @@ class TestMemoryBlockPlacement:
         assert "[semantic" not in SYSTEM_PROMPT
         assert "[episodic" not in SYSTEM_PROMPT
         assert "{" not in SYSTEM_PROMPT  # no interpolation slot at all
+
+
+class TestReplayableHistory:
+    """A stored turn replayed as history must be a valid request.
+
+    Found by the cross-session suite on its first run, not by a unit test: a
+    `tool_use` block was persisted verbatim (correct, §4) with no `tool_result`
+    to follow it, so every second turn that had called a tool returned 400.
+    Single-turn evals never saw it, and the caching test's second turn happened
+    not to call a tool.
+    """
+
+    def test_tool_use_is_dropped_on_replay(self):
+        content = [
+            {"type": "text", "text": "Looking that up."},
+            {"type": "tool_use", "id": "toolu_1", "name": "merged_prs", "input": {}},
+        ]
+        assert replayable(content) == [{"type": "text", "text": "Looking that up."}]
+
+    def test_tool_result_is_dropped_too(self):
+        """The other half of the pair. A result with no preceding use is the
+        same error from the other side."""
+        content = [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "x"}]
+        assert replayable(content) == []
+
+    def test_text_only_content_is_untouched(self):
+        content = [{"type": "text", "text": "PR 15806 did not ship."}]
+        assert replayable(content) == content
+
+    def test_a_plain_string_message_passes_through(self):
+        """User turns are persisted as bare strings, not block lists."""
+        assert replayable("what shipped last month?") == "what shipped last month?"
+
+    def test_thinking_blocks_are_dropped_too(self):
+        """The second half of the same bug, and the reason this is an allowlist.
+
+        Removing `tool_use` from a message that also thought counts as
+        *modifying* the thinking block, which the API rejects on its own — so
+        dropping one without the other just trades a paired-block error for a
+        thinking-block error. The first fix did exactly that.
+        """
+        content = [
+            {"type": "thinking", "thinking": "..."},
+            {"type": "text", "text": "hi"},
+            {"type": "tool_use", "id": "t", "name": "merged_prs", "input": {}},
+        ]
+        assert replayable(content) == [{"type": "text", "text": "hi"}]

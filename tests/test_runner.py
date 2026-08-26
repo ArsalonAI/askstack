@@ -7,6 +7,9 @@ invisible behind a plausible-looking metric.
 
 import json
 
+import pytest
+
+from app.tools.registry import ALWAYS_INJECTED
 from evals.runner import (
     CACHE_FORMAT,
     _load_cache,
@@ -182,3 +185,30 @@ class TestMRRAtK:
 
     def test_no_hit(self):
         assert mrr_at_k(["a", "b"], ["gold"], k=10) == 0.0
+
+
+class TestAlwaysInjectedExclusion:
+    """§7.2.2 — tool accuracy is computed over the retrieved set, excluding the
+    always-on tools.
+
+    Without this, memory shipping at M3 would show up as a tool-accuracy drop
+    caused entirely by two tools being present in every request. The metric
+    would move because the system gained a feature, not because the selector
+    got worse, and the M2→M3 comparison would read as a regression.
+    """
+
+    def test_the_memory_tools_are_the_always_injected_set(self):
+        assert set(ALWAYS_INJECTED) == {"memory_search", "memory_write"}
+
+    def test_excluding_them_leaves_the_selector_measured_alone(self):
+        selected = {"merged_prs", "pr_state", "memory_search", "memory_write"}
+        scored = {t for t in selected if t not in ALWAYS_INJECTED}
+        assert scored == {"merged_prs", "pr_state"}
+
+    def test_a_perfect_selection_still_scores_1_with_memory_present(self):
+        """The case that would silently break: gold is one tool, the selector
+        found exactly it, and two always-on tools drag jaccard to 0.33."""
+        selected = {"pr_state", "memory_search", "memory_write"}
+        scored = {t for t in selected if t not in ALWAYS_INJECTED}
+        assert jaccard(scored, {"pr_state"}) == 1.0
+        assert jaccard(selected, {"pr_state"}) == pytest.approx(1 / 3)
