@@ -19,6 +19,7 @@ code than the re-send this loop already does. See §10 as amended.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
@@ -32,6 +33,7 @@ import asyncpg
 from app.config import Settings
 from app.ingest.citations import Citation, scan
 from app.interfaces import Aggregate, Entity
+from app.memory.lifecycle import should_extract
 from app.memory.manager import effective_confidence
 from app.tools.registry import MEMORY_TOOLS, ToolOutcome, ToolRegistry
 from app.tools.selector import to_api_tools
@@ -104,6 +106,14 @@ class Turn:
         at was *actually looked up this turn*. Citing a real pull request the
         agent never opened is indistinguishable from a correct answer without
         this set."""
+        # Memory is neither substrate, and the exclusion is load-bearing twice
+        # over. `memory_search` returns `list[Memory]`, which has no `citation`
+        # — the branch below would raise on it. And if it somehow succeeded, a
+        # remembered pull request would enter this turn's result set and start
+        # resolving as one the agent had actually looked up, which is exactly
+        # the failure the result set exists to catch.
+        if outcome.name in MEMORY_TOOLS:
+            return
         result = outcome.result
         if isinstance(result, Aggregate):
             self.entity_results.update(e.citation for e in result.entities)
@@ -264,6 +274,7 @@ class Orchestrator:
         as_of: datetime | None = None,
         tracer=None,
         memory=None,
+        extractor=None,
     ) -> None:
         self.pool = pool
         self.registry = registry
@@ -274,11 +285,45 @@ class Orchestrator:
         # with memory disabled there is no block, no `memory_loaded` event, and
         # no memory tools in the catalog.
         self.memory = memory if settings.memory_enabled else None
+        self.extractor = extractor if settings.memory_enabled else None
+        # Strong references to detached tasks. asyncio only holds a weak one,
+        # so a task nobody keeps can be garbage-collected mid-flight — the
+        # extraction would vanish silently, which is the worst possible failure
+        # mode for background work whose whole job is to happen unobserved.
+        self._tasks: set[asyncio.Task] = set()
         self.tracer = tracer or Tracer(settings)
         # Default to the corpus pin rather than wall-clock now: the corpus
         # cannot know anything after the revision it was ingested at, so a
         # window running past it would silently under-report.
         self.as_of = as_of or datetime.now(UTC)
+
+    async def end_session(self, session_id: str):
+        """Close a session and extract from it — §8.1's other trigger.
+
+        Awaited rather than detached, unlike the mid-session trigger. There is
+        no turn waiting on this, so there is no latency to protect; and a
+        caller that ends a session and immediately starts the next one needs
+        the memories to exist before that next session loads its block. A
+        detached task would race the very thing it exists to feed.
+
+        Idempotent: ending an already-ended session extracts nothing rather
+        than extracting the same transcript twice.
+        """
+        async with self.pool.acquire() as conn:
+            closed = await conn.fetchval(
+                "UPDATE sessions SET ended_at = now()"
+                " WHERE id = $1 AND ended_at IS NULL RETURNING id",
+                session_id,
+            )
+        if closed is None or self.extractor is None:
+            return None
+        return await self.extractor.extract(session_id)
+
+    def _background(self, coro) -> None:
+        """Detach a coroutine, keeping a reference until it finishes."""
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
     # ---------------------------------------------------------------- session
 
@@ -623,6 +668,13 @@ class Orchestrator:
             [_wire_block(b) for b in assistant_blocks],
             trace_id,
         )
+
+        # §8.1's mid-session trigger, fired after the turn is persisted so the
+        # extractor reads a complete transcript. Detached rather than awaited:
+        # the manager already has their answer, and the bookkeeping that helps
+        # their *next* session must not be billed to this one's latency.
+        if self.extractor is not None and should_extract(turn):
+            self._background(self.extractor.extract(session_id))
 
         done = {
             "turn": turn,

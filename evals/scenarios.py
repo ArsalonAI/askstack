@@ -74,6 +74,9 @@ class SessionResult:
     index: int
     session_id: str | None
     turns: list[TurnResult] = field(default_factory=list)
+    # Memories §8.1 extracted when this session ended. The number that explains
+    # whether the *next* session had anything to load.
+    extracted: int = 0
 
     @property
     def cost_usd(self) -> float:
@@ -229,9 +232,46 @@ async def run_scenario(
             # scenario another turn — this is the measurement.
             prompt = clarification
 
+        # §8.1's session-end trigger, awaited so session N's memories exist
+        # before session N+1 loads its block. This is the whole mechanism the
+        # suite measures: without it a three-turn check-in extracts nothing and
+        # both arms are identical by construction.
+        session_result.extracted = await _end_session(
+            session_id,
+            pool=pool,
+            retriever=retriever,
+            client=client,
+            arm_settings=arm_settings,
+        )
         result.sessions.append(session_result)
 
     return result
+
+
+async def _end_session(
+    session_id: str | None, *, pool, retriever, client, arm_settings
+) -> int:
+    if session_id is None or not arm_settings.memory_enabled:
+        return 0
+    from app.memory.lifecycle import Extractor
+    from evals.runner import build_memory
+
+    manager = build_memory(pool, retriever.embedder, client, arm_settings)
+    if manager is None:
+        return 0
+    extractor = Extractor(
+        pool, manager.store, retriever.embedder, client, arm_settings
+    )
+    async with pool.acquire() as conn:
+        closed = await conn.fetchval(
+            "UPDATE sessions SET ended_at = now()"
+            " WHERE id = $1 AND ended_at IS NULL RETURNING id",
+            session_id,
+        )
+    if closed is None:
+        return 0
+    report = await extractor.extract(session_id)
+    return report.written
 
 
 def arm_settings_name(arm: Settings) -> str:
@@ -374,9 +414,11 @@ def print_report(results: list[ScenarioResult], arms: dict) -> None:
         turns = result.turns_to_success or "—"
         loaded = sum(t.memories_loaded for s in result.sessions for t in s.turns)
         writes = sum(t.memory_writes for s in result.sessions for t in s.turns)
+        extracted = sum(s.extracted for s in result.sessions)
         print(
             f"    {result.scenario_id}  {result.arm:<3}  {mark}  turns={turns}  "
-            f"mem_loaded={loaded}  mem_writes={writes}  ${result.cost_usd:.3f}"
+            f"mem_loaded={loaded}  extracted={extracted}  agent_writes={writes}  "
+            f"${result.cost_usd:.3f}"
         )
         if result.error:
             print(f"          error: {result.error}")

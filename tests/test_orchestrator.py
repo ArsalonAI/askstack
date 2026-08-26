@@ -267,3 +267,51 @@ class TestReplayableHistory:
             {"type": "tool_use", "id": "t", "name": "merged_prs", "input": {}},
         ]
         assert replayable(content) == [{"type": "text", "text": "hi"}]
+
+
+class TestMemoryIsNotAResultSet:
+    """`memory_search` returns `list[Memory]`, which is a list — and every
+    list-shaped tool result before it was `list[Chunk]`.
+
+    Found by the cross-session suite once extraction made memory non-empty
+    enough for the agent to call `memory_search` at all: `Turn.record` reached
+    for `.citation` on a `Memory` and took the whole turn down. Unit tests
+    could not see it because nothing had ever put a `Memory` on this path.
+    """
+
+    def test_memory_search_results_never_enter_the_result_set(self):
+        turn = Turn()
+        turn.record(outcome("memory_search", [_memory()]))
+        assert turn.span_results == set()
+        assert turn.entity_results == set()
+
+    def test_a_remembered_entity_does_not_resolve_as_looked_up(self):
+        """The reason this matters beyond the crash: memory naming a PR is not
+        the same as the agent having checked it, and §11.2's second half is the
+        only thing that tells them apart."""
+        turn = Turn()
+        turn.record(outcome("memory_search", [_memory("we discussed pr:15806")]))
+        assert "pr:15806" not in turn.entity_results
+
+    def test_memory_write_records_nothing(self):
+        turn = Turn()
+        turn.record(outcome("memory_write", _memory()))
+        assert not turn.span_results and not turn.entity_results
+
+    def test_a_real_search_still_records(self):
+        """The guard must be scoped to memory, not to list results generally."""
+        turn = Turn()
+        turn.record(outcome("search_issues", [chunk()]))
+        assert turn.span_results == {"issue:98#comment-0"}
+
+
+def _memory(content="a fact"):
+    from app.interfaces import Memory
+
+    return Memory(
+        id="mem_1", user_id="u1", mem_type="episodic", content=content,
+        entities=(), confidence=0.8, revision=1,
+        valid_from=datetime(2026, 8, 26, tzinfo=UTC), valid_to=None,
+        created_by="extraction", source_session_id="sess_1", source_ids=(),
+        trace_id=None,
+    )

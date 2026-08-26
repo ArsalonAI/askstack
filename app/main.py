@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 
 from app.config import settings
 from app.facts.store import PostgresFactsStore
+from app.memory.lifecycle import Extractor
 from app.memory.manager import MemoryManager
 from app.memory.store import PostgresMemoryStore
 from app.orchestrator import Orchestrator, sse
@@ -76,13 +77,23 @@ def _orchestrator(as_of: datetime | None = None) -> Orchestrator:
     # `None` when MEMORY_ENABLED is false, which drops both memory tools from
     # the catalog rather than offering tools that would fail — the ablation's
     # off arm has to measure a system without memory (§7.3).
+    store = PostgresMemoryStore(pool)
     memory = (
         MemoryManager(
-            PostgresMemoryStore(pool),
+            store,
             app.state.embedder,
             app.state.client,
             model=settings.agent_model,
         )
+        if settings.memory_enabled
+        else None
+    )
+    # §8.1 runs as a background task off the orchestrator, not a FastAPI
+    # BackgroundTask: the SSE response is a long-lived stream, and a FastAPI
+    # background task only fires once that stream closes — which for a client
+    # that disconnects early is never.
+    extractor = (
+        Extractor(pool, store, app.state.embedder, app.state.client, settings)
         if settings.memory_enabled
         else None
     )
@@ -112,6 +123,7 @@ def _orchestrator(as_of: datetime | None = None) -> Orchestrator:
         settings,
         as_of=as_of or app.state.as_of,
         memory=memory,
+        extractor=extractor,
     )
 
 
@@ -151,6 +163,28 @@ async def chat(request: ChatRequest) -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.post("/sessions/{session_id}/end")
+async def end_session(session_id: str) -> dict:
+    """§8.1's session-end extraction trigger.
+
+    Not in §11.1's original endpoint table, and it has to be: extraction's two
+    triggers are "every 10 turns" and "session end", and nothing in a stateless
+    HTTP API tells the server a session is over. Without this, a three-turn
+    session — the shape PRD §7.2's whole cross-session suite is built from —
+    never extracts anything, and memory stays empty for exactly the case it
+    exists to serve.
+    """
+    report = await _orchestrator().end_session(session_id)
+    if report is None:
+        return {"session_id": session_id, "extracted": 0, "already_ended": True}
+    return {
+        "session_id": session_id,
+        "extracted": report.written,
+        "considered": report.considered,
+        "discarded_low_confidence": report.discarded_low_confidence,
+    }
 
 
 @app.get("/sessions/{session_id}")

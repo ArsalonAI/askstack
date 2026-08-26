@@ -881,7 +881,15 @@ Reporting rules, non-negotiable:
 
 ### 8.1 Extraction
 
-Trigger: session end, or every 10 turns for long sessions. Runs as a FastAPI `BackgroundTask` so it never blocks a response.
+Trigger: session end, or every 10 turns for long sessions.
+
+**Session end needs an endpoint, because nothing else tells the server a session is over.** `POST /sessions/{id}/end` is that signal, added to §11.1 at M4. Without it only the 10-turn trigger exists, and the three-turn check-in that PRD §7.2's entire cross-session suite is built from would extract nothing — memory would stay empty for exactly the case it exists to serve. The endpoint is idempotent: ending an already-ended session extracts nothing rather than extracting the same transcript twice.
+
+**The two triggers differ in whether they are awaited, and it is not an inconsistency.** The 10-turn trigger is detached — a manager waiting on their answer must not be billed the latency of bookkeeping that helps their *next* session. Session end is awaited, because there is no turn waiting on it and because a caller that ends one session and immediately opens the next needs those memories to exist before the next session loads its block. A detached task there would race the very thing it exists to feed.
+
+**Only user and assistant text reaches the model.** Tool calls and their results are the system's own working: the manager never saw them, and a fact extracted from a tool result is a fact about the *corpus* rather than about this user — which the facts layer already answers better and, unlike a memory, without going stale.
+
+**A failure here never surfaces on the request that produced it.** Extraction runs after the user already has their answer, so an API error, a refusal, or unparseable output costs the next session some context and nothing more.
 
 One Claude call over the transcript with `output_config.format`:
 
@@ -1043,6 +1051,7 @@ This section specified `client.beta.messages.tool_runner` until M2 built against
 | `POST` | `/chat` | `ChatRequest` | `text/event-stream` |
 | `GET` | `/sessions/{id}` | — | `Session` with messages |
 | `GET` | `/sessions` | `user_id`, `limit` | `Session[]` |
+| `POST` | `/sessions/{id}/end` | — | `{session_id, extracted, considered, discarded_low_confidence}` |
 | `GET` | `/memory` | `user_id`, `type?`, `include_superseded?` | `Memory[]` |
 | `GET` | `/memory/{id}/history` | — | `Memory[]`, oldest first |
 | `POST` | `/memory/{id}/revert` | `to_revision`, `actor` | `Memory` |
