@@ -213,6 +213,10 @@ async def score_agent(orchestrator, question: dict, gold_entities: list[str]) ->
     # Kept in the cache so a later reading can be compared without re-running
     # fifty paid turns to get the breakdown back.
     retrievals: list[dict] = []
+    # The semantic half of the same breakdown. Not scored — §17 Q11 is open —
+    # but recorded, because the evidence for deciding it is per-call and is
+    # destroyed by the flattening two lines below.
+    searches: list[dict] = []
     chunks: list[str] = []
     citations: list[dict] = []
     tool_calls: list[str] = []
@@ -233,7 +237,11 @@ async def score_agent(orchestrator, question: dict, gold_entities: list[str]) ->
                     }
                 )
             else:
-                chunks.extend(c["citation"] for c in data["chunks"])
+                cites = [c["citation"] for c in data["chunks"]]
+                searches.append(
+                    {"tool": data["tool"], "query": data["query"], "chunks": cites}
+                )
+                chunks.extend(cites)
         elif event == "citation":
             citations.append(data)
         elif event == "tool_call" and data["status"] != "started":
@@ -282,6 +290,7 @@ async def score_agent(orchestrator, question: dict, gold_entities: list[str]) ->
             "called": tool_calls,
             "gold_tools": sorted(gold_tools),
             "retrievals": retrievals,
+            "searches": searches,
             "citations": citations,
             "error": error,
             "usage": usage,
