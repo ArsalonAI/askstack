@@ -138,6 +138,28 @@ was closed without merging. A system that reads the title, or that treats "close
 | Merged PRs since 2025-01-01 | 1,092 | 1,092 | ✅ |
 | Closed issues, all time | 3,541 | 3,541 | ✅ |
 
+## A known looseness in q015 — recorded, not fixed
+
+q015 asks *"What has merged since the 0.138.0 release?"* and its `gold_query` starts
+at `2026-06-19T00:00Z`. The release was actually published at **`2026-06-20T01:17Z`**
+— the gold window opens about 25 hours early, because it was authored from the tag's
+date in the maintainer's local timezone rather than the publication instant.
+
+**11 merged pull requests fall in that gap**, and all of them shipped *in* 0.138.0
+rather than since it. So the exactly-correct answer to the question as asked is 125
+pull requests; the committed ground truth says 136.
+
+M2's `merged_prs` tool resolves `since release <tag>` to the publication instant,
+which is the correct reading and the one that avoids reporting already-shipped work
+as new (PRD §5.2). An agent that gets q015 *right* therefore scores about 0.96 on it,
+permanently.
+
+This is written down rather than corrected because the freeze rule applies: q015 has
+been scored, so it cannot be edited, and a corrected window would need a new id. It
+is also written down so nobody later "fixes" the 0.96 by loosening the tool to match
+the gold — that would trade a correct answer for a better-looking number, which is
+the exact failure the freeze rule exists to prevent.
+
 ## Regenerating
 
 ```bash

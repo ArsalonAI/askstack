@@ -66,7 +66,7 @@ class ValidationError(Exception):
     pass
 
 
-def _as_datetime(value: Any) -> datetime:
+def as_datetime(value: Any) -> datetime:
     if isinstance(value, datetime):
         return value if value.tzinfo else value.replace(tzinfo=UTC)
     if isinstance(value, date):
@@ -137,7 +137,7 @@ async def validate(conn: asyncpg.Connection, questions: list[dict], pin: dict) -
         if not as_of_raw:
             errors.append(f"{where}: as_of is required — every question is date-anchored")
             continue
-        as_of = _as_datetime(as_of_raw)
+        as_of = as_datetime(as_of_raw)
 
         # §14.1: a question anchored after the pin cannot be answered correctly
         # by any system, and scoring it looks like a retrieval regression.
@@ -170,7 +170,7 @@ async def validate(conn: asyncpg.Connection, questions: list[dict], pin: dict) -
                 )
             for key in ("since", "until"):
                 if key in spec.get("args", {}):
-                    bound = _as_datetime(spec["args"][key])
+                    bound = as_datetime(spec["args"][key])
                     if floor and bound < floor:
                         errors.append(
                             f"{where}: gold_query.{key} {bound.date()} precedes the "
@@ -193,11 +193,11 @@ async def run_query(store: PostgresFactsStore, question: dict) -> list[str]:
     spec = question["gold_query"]
     method = spec["method"]
     args = dict(spec.get("args") or {})
-    as_of = _as_datetime(question["as_of"])
+    as_of = as_datetime(question["as_of"])
 
     for key in ("since", "until"):
         if key in args:
-            args[key] = _as_datetime(args[key])
+            args[key] = as_datetime(args[key])
     if method in NEEDS_AS_OF:
         args["as_of"] = as_of
 

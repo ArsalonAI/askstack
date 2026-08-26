@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 
 import asyncpg
 import numpy as np
@@ -54,6 +54,22 @@ WHERE tsv @@ plainto_tsquery('english', $1)
 ORDER BY score DESC
 LIMIT $3
 """
+
+
+class _NullSpan:
+    def update(self, **kwargs) -> None: ...
+
+
+class _NullTrace:
+    """Stands in when no tracer is passed, so the hot path has no `if trace:`
+    branches and the retriever needs no observability stack to run."""
+
+    @contextmanager
+    def span(self, name: str, **kwargs):
+        yield _NullSpan()
+
+
+_NO_TRACE = _NullTrace()
 
 
 def _vector_literal(vector: np.ndarray) -> str:
@@ -151,8 +167,13 @@ class HybridRetriever:
         query: str,
         k: int,
         sources: Sequence[Source] | None = None,
+        trace=None,
     ) -> list[Chunk]:
+        """`trace` is the §12 span parent. Optional and defaulted so the
+        retriever stays usable — and testable — with no observability stack;
+        §14.4 needs retrieval metrics reproducible with no network at all."""
         source_filter = list(sources) if sources else None
+        trace = trace or _NO_TRACE
 
         # Encoding is CPU-bound and blocks the loop for tens of milliseconds;
         # off-thread so the sparse arm is not waiting on it.
@@ -160,23 +181,40 @@ class HybridRetriever:
 
         if not self.hybrid:
             # Ablation axis A off: dense only, ranked by cosine similarity.
-            rows = await self._dense(query_vec, source_filter)
+            with trace.span("retrieve.dense", metadata={"k": k, "ef_search": EF_SEARCH}) as s:
+                rows = await self._dense(query_vec, source_filter)
+                s.update(metadata={"n_results": len(rows), "hybrid": False})
             return [_chunk(row, float(row["score"])) for row in rows[:k]]
 
         if isinstance(self.db, asyncpg.Pool):
-            dense_rows, sparse_rows = await asyncio.gather(
-                self._dense(query_vec, source_filter),
-                self._sparse(query, source_filter),
-            )
+            with trace.span("retrieve.dense", metadata={"ef_search": EF_SEARCH}), trace.span(
+                "retrieve.sparse"
+            ):
+                dense_rows, sparse_rows = await asyncio.gather(
+                    self._dense(query_vec, source_filter),
+                    self._sparse(query, source_filter),
+                )
         else:
-            dense_rows = await self._dense(query_vec, source_filter)
-            sparse_rows = await self._sparse(query, source_filter)
+            with trace.span("retrieve.dense", metadata={"ef_search": EF_SEARCH}):
+                dense_rows = await self._dense(query_vec, source_filter)
+            with trace.span("retrieve.sparse"):
+                sparse_rows = await self._sparse(query, source_filter)
 
         by_id = {row["id"]: row for row in [*dense_rows, *sparse_rows]}
-        scores = fuse(
-            [row["id"] for row in dense_rows],
-            [row["id"] for row in sparse_rows],
-        )
+        dense_ids = [row["id"] for row in dense_rows]
+        sparse_ids = [row["id"] for row in sparse_rows]
+        with trace.span(
+            "retrieve.fuse",
+            metadata={
+                "rrf_k": RRF_K,
+                "n_in": len(by_id),
+                "n_out": min(k, len(by_id)),
+                # How much the two arms agreed. A persistent zero means one arm
+                # is contributing nothing and the ablation is measuring itself.
+                "overlap": len(set(dense_ids) & set(sparse_ids)),
+            },
+        ):
+            scores = fuse(dense_ids, sparse_ids)
         # Ties broken by id so a run is reproducible — two chunks matched by
         # one arm at adjacent ranks score identically often enough that dict
         # order would otherwise leak into recall@5.
