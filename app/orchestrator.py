@@ -32,7 +32,8 @@ import asyncpg
 from app.config import Settings
 from app.ingest.citations import Citation, scan
 from app.interfaces import Aggregate, Entity
-from app.tools.registry import ToolOutcome, ToolRegistry
+from app.memory.manager import effective_confidence
+from app.tools.registry import MEMORY_TOOLS, ToolOutcome, ToolRegistry
 from app.tools.selector import to_api_tools
 from app.tracing import Tracer
 
@@ -161,6 +162,13 @@ def _wire_block(block) -> dict[str, Any]:
 
 def _retrieval_event(outcome: ToolOutcome) -> dict[str, Any] | None:
     """§11.2 has two `retrieval` shapes — one per substrate."""
+    # Memory is neither substrate. `memory_search` returns rows about the user,
+    # not passages from the corpus, and emitting them as a retrieval would put
+    # them in this turn's result set — which is what citation resolution checks
+    # against, so a remembered pull request would start resolving as one the
+    # agent had actually looked up.
+    if outcome.name in MEMORY_TOOLS:
+        return None
     result = outcome.result
     if isinstance(result, list):
         return {
@@ -225,12 +233,17 @@ class Orchestrator:
         *,
         as_of: datetime | None = None,
         tracer=None,
+        memory=None,
     ) -> None:
         self.pool = pool
         self.registry = registry
         self.selector = selector
         self.client = client
         self.settings = settings
+        # The ablation's off arm is `None`, not a manager that returns nothing:
+        # with memory disabled there is no block, no `memory_loaded` event, and
+        # no memory tools in the catalog.
+        self.memory = memory if settings.memory_enabled else None
         self.tracer = tracer or Tracer(settings)
         # Default to the corpus pin rather than wall-clock now: the corpus
         # cannot know anything after the revision it was ingested at, so a
@@ -331,6 +344,42 @@ class Orchestrator:
         history, turn = await self._history(session_id)
         await self._persist(session_id, turn, "user", message, trace_id)
 
+        # §2.1 step 2. Bound before tool selection so the registry can dispatch
+        # `memory_write` for this user without the model naming them.
+        self.registry.for_turn(user_id, session_id, trace_id)
+        memory_block = None
+        if self.memory is not None:
+            with trace.span(
+                "memory.load", metadata={"budget": self.settings.memory_token_budget}
+            ) as span:
+                memory_block = await self.memory.load_context(
+                    user_id, session_id, message, self.settings.memory_token_budget
+                )
+                span.update(
+                    metadata={
+                        "loaded": len(memory_block.memories),
+                        "tokens": memory_block.token_count,
+                        "truncated": memory_block.truncated,
+                    }
+                )
+            yield "memory_loaded", {
+                "memories": [
+                    {
+                        "id": m.id,
+                        "type": m.mem_type,
+                        "content": m.content,
+                        "confidence": round(m.confidence, 3),
+                        "effective_confidence": round(effective_confidence(m), 3),
+                        "created_by": m.created_by,
+                        "source_session_id": m.source_session_id,
+                        "revision": m.revision,
+                    }
+                    for m in memory_block.memories
+                ],
+                "token_count": memory_block.token_count,
+                "truncated": memory_block.truncated,
+            }
+
         with trace.span(
             "tools.select",
             metadata={
@@ -358,7 +407,19 @@ class Orchestrator:
             "floor": self.settings.tool_similarity_floor,
         }
 
+        # §9: the memory block is `messages[0]`, a user-turn preamble *after*
+        # the cached prefix. In the system prompt it would invalidate the cache
+        # on every new session (ADR 8).
+        #
+        # Prepended on every turn rather than persisted into turn one. The
+        # block is not conversation — it is derived state, reloaded per request
+        # against the current query (§2.1 step 2) — and writing it into
+        # `messages` would freeze one turn's memories into the transcript and
+        # replay them for the rest of the session. Nothing is cached past the
+        # system prompt, so rebuilding it each turn costs no cache hit.
         messages = [*history, {"role": "user", "content": message}]
+        if memory_block is not None and memory_block.text:
+            messages = [{"role": "user", "content": memory_block.text}, *messages]
         # `native` mode contributes deferred flags and the provider's own
         # tool-search tool. Merged explicitly rather than splatted, so a mode
         # cannot silently overwrite the `tools` the selector just chose.
@@ -490,6 +551,14 @@ class Orchestrator:
                         }
                         if payload := _retrieval_event(outcome):
                             yield "retrieval", payload
+                        if block.name == "memory_write" and not outcome.is_error:
+                            written = outcome.result
+                            yield "memory_write", {
+                                "id": written.id,
+                                "type": written.mem_type,
+                                "content": written.content,
+                                "confidence": round(written.confidence, 3),
+                            }
                         results.append(
                             {
                                 "type": "tool_result",

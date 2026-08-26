@@ -20,10 +20,12 @@ from pydantic import BaseModel, Field
 
 from app.config import settings
 from app.facts.store import PostgresFactsStore
+from app.memory.manager import MemoryManager
+from app.memory.store import PostgresMemoryStore
 from app.orchestrator import Orchestrator, sse
 from app.retrieval.embedder import get_embedder
 from app.retrieval.hybrid import HybridRetriever
-from app.tools.registry import CATALOG, ToolRegistry
+from app.tools.registry import ToolRegistry
 from app.tools.selector import build_selector
 
 log = logging.getLogger(__name__)
@@ -71,14 +73,33 @@ app = FastAPI(title="askstack", lifespan=lifespan)
 def _orchestrator(as_of: datetime | None = None) -> Orchestrator:
     pool = app.state.pool
     retriever = HybridRetriever(pool, app.state.embedder)
+    # `None` when MEMORY_ENABLED is false, which drops both memory tools from
+    # the catalog rather than offering tools that would fail — the ablation's
+    # off arm has to measure a system without memory (§7.3).
+    memory = (
+        MemoryManager(
+            PostgresMemoryStore(pool),
+            app.state.embedder,
+            app.state.client,
+            model=settings.agent_model,
+        )
+        if settings.memory_enabled
+        else None
+    )
     # One connection for the facts layer per request-scoped orchestrator; the
     # retriever takes the pool because §2.1 runs its two arms concurrently.
     registry = ToolRegistry(
-        PostgresFactsStore(pool), retriever, top_k=settings.retrieval_top_k
+        PostgresFactsStore(pool),
+        retriever,
+        top_k=settings.retrieval_top_k,
+        memory=memory,
     )
     selector = build_selector(
         settings.tool_retrieval_mode,
-        CATALOG,
+        # The registry's view, not the raw catalog: with memory off it omits
+        # both memory tools, and the selector must not offer what dispatch
+        # would refuse.
+        registry.definitions(),
         pool=pool,
         embedder=app.state.embedder,
         floor=settings.tool_similarity_floor,
@@ -90,6 +111,7 @@ def _orchestrator(as_of: datetime | None = None) -> Orchestrator:
         app.state.client,
         settings,
         as_of=as_of or app.state.as_of,
+        memory=memory,
     )
 
 

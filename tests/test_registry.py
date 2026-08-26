@@ -12,8 +12,8 @@ import pytest
 import yaml
 
 from app.facts.areas import UnknownArea
-from app.interfaces import Aggregate, Chunk, Entity
-from app.tools.registry import BY_NAME, CATALOG, ToolRegistry
+from app.interfaces import Aggregate, Chunk, Entity, Memory
+from app.tools.registry import ALWAYS_INJECTED, BY_NAME, CATALOG, ToolRegistry
 
 AS_OF = datetime(2026, 7, 29, tzinfo=UTC)
 
@@ -80,8 +80,55 @@ def entity(kind="pr", ref="15806", state="closed", at=None) -> Entity:
     )
 
 
-def registry(facts=None, retriever=None) -> ToolRegistry:
-    return ToolRegistry(facts or StubFacts(), retriever or StubRetriever())
+class StubMemory:
+    """Stands in for the Manager. Records what it was asked to write, so the
+    tests can assert that the turn binding — not the model — decides whose
+    memory is touched."""
+
+    def __init__(self, found=None) -> None:
+        self.written: list[dict] = []
+        self.searched: list[dict] = []
+        self._found = found or []
+
+    async def record(self, session_id, statement, **kw):
+        self.written.append({"session_id": session_id, "statement": statement, **kw})
+        return _memory(statement)
+
+    async def search(self, user_id, query, *, mem_type=None, k=5):
+        self.searched.append({"user_id": user_id, "query": query, "type": mem_type})
+        return list(self._found)
+
+
+def _memory(content="a fact", mem_type="episodic"):
+    return Memory(
+        id="mem_x",
+        user_id="u1",
+        mem_type=mem_type,
+        content=content,
+        entities=(),
+        confidence=0.8,
+        revision=1,
+        valid_from=AS_OF,
+        valid_to=None,
+        created_by="agent",
+        source_session_id="sess_1",
+        source_ids=(),
+        trace_id=None,
+    )
+
+
+_DEFAULT = object()  # `memory=None` means "memory disabled", not "unspecified"
+
+
+def registry(facts=None, retriever=None, memory=_DEFAULT, *, bind=True) -> ToolRegistry:
+    built = ToolRegistry(
+        facts or StubFacts(),
+        retriever or StubRetriever(),
+        memory=StubMemory() if memory is _DEFAULT else memory,
+    )
+    if bind:
+        built.for_turn("u1", "sess_1", "trace_1")
+    return built
 
 
 class TestCatalog:
@@ -254,6 +301,63 @@ class TestDispatch:
         assert isinstance(outcome.result, Entity)
         assert outcome.result.citation == "pr:15806"
 
+    async def test_memory_write_takes_the_user_from_the_turn_not_the_model(self):
+        """A `user_id` the model fills in is one it can get wrong or be talked
+        into changing, and the blast radius is one user's memory written into
+        another's. The schema deliberately has no such field."""
+        assert "user_id" not in BY_NAME["memory_write"].input_schema["properties"]
+        memory = StubMemory()
+        await registry(memory=memory).dispatch(
+            "memory_write", {"statement": "only auth PRs matter"}, as_of=AS_OF
+        )
+        written = memory.written[0]
+        assert written["user_id"] == "u1"
+        assert written["session_id"] == "sess_1"
+        assert written["trace_id"] == "trace_1"
+
+    async def test_memory_write_defaults_confidence_rather_than_demanding_it(self):
+        memory = StubMemory()
+        await registry(memory=memory).dispatch(
+            "memory_write", {"statement": "x"}, as_of=AS_OF
+        )
+        assert 0.0 <= memory.written[0]["confidence"] <= 1.0
+
+    async def test_memory_search_reports_a_miss_as_a_fact(self):
+        """"Nothing remembered about X" is an answer, and must not read the
+        same as a tool that failed."""
+        outcome = await registry(memory=StubMemory([])).dispatch(
+            "memory_search", {"query": "x"}, as_of=AS_OF
+        )
+        assert not outcome.is_error
+        assert "Nothing in memory" in outcome.rendered
+
+    async def test_memory_search_renders_provenance(self):
+        """§8.5 — the model must be able to discount a memory, which it cannot
+        do if the rendering hides where the memory came from."""
+        outcome = await registry(memory=StubMemory([_memory("asked in July")])).dispatch(
+            "memory_search", {"query": "x"}, as_of=AS_OF
+        )
+        assert "episodic" in outcome.rendered
+        assert "asked in July" in outcome.rendered
+
+    async def test_memory_tools_are_absent_when_memory_is_disabled(self):
+        """The ablation's off arm measures a system without memory, not one
+        with two broken tools in the prompt."""
+        names = {t.name for t in registry(memory=None, bind=False).definitions()}
+        assert not names & set(ALWAYS_INJECTED)
+
+    async def test_calling_a_memory_tool_with_memory_disabled_errors(self):
+        outcome = await registry(memory=None, bind=False).dispatch(
+            "memory_write", {"statement": "x"}, as_of=AS_OF
+        )
+        assert outcome.is_error
+
+    async def test_an_unbound_turn_errors_rather_than_guessing_a_user(self):
+        outcome = await registry(bind=False).dispatch(
+            "memory_write", {"statement": "x"}, as_of=AS_OF
+        )
+        assert outcome.is_error
+
     @pytest.mark.parametrize("name", sorted(BY_NAME))
     async def test_every_tool_dispatches(self, name):
         """A tool in the catalog with no dispatch branch is invisible until a
@@ -270,6 +374,8 @@ class TestDispatch:
             "search_docs": {"query": "x"},
             "search_code": {"query": "x"},
             "search_issues": {"query": "x"},
+            "memory_write": {"statement": "they track the auth workstream"},
+            "memory_search": {"query": "x"},
         }[name]
         outcome = await registry(StubFacts(entity())).dispatch(name, arguments, as_of=AS_OF)
         assert not outcome.is_error, outcome.rendered

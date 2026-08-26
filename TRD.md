@@ -845,7 +845,16 @@ The system prompt states this constraint explicitly, and the eval's aggregate se
 
 `memory_write` and `memory_search` are **always injected** regardless of score. They are agent-infrastructure tools whose relevance is never expressed in the user's query — the user never says "please save this to memory", so semantic retrieval would never surface them, and the write-back loop would silently never fire. This exemption is disclosed in every reported tool-accuracy number: accuracy is computed over the *retrieved* set excluding the two always-on tools.
 
-**At M2 the always-injected set is empty.** Both tools are memory infrastructure and memory arrives at M3, so the M2 tool-accuracy denominator is the whole selected set with nothing excluded. The M3 baseline changes that denominator; §14.3's `milestone` field is what keeps the two from being compared as though they measured the same thing.
+**At M2 the always-injected set was empty**, because both tools are memory infrastructure and memory arrived at M3. The M2 tool-accuracy denominator is therefore the whole selected set with nothing excluded, and the M3 denominator is not — §14.3's `milestone` field is what keeps the two from being compared as though they measured the same thing.
+
+**From M3 the set is `{memory_search, memory_write}`, and it is conditional.** With `MEMORY_ENABLED=false` the registry omits both tools from `definitions()` and the selector is built from that view, so the off arm offers no memory tools rather than offering two that dispatch would refuse. `always_injected` intersects with the caller's catalog rather than asserting the pair exists, which is what makes the off arm a system without memory instead of a system with a broken tool in its prompt.
+
+Two placement details that are easy to get wrong in opposite directions:
+
+- **They are added after the top-k, not counted against it.** `k` bounds how many tools *retrieval* chose; spending one of those slots on a tool that was never a candidate would make the semantic arm look worse than it is.
+- **In `native` mode they are never deferred.** Deferring them puts them behind a BM25 search the model has no reason to run — no question is phrased so that `memory_write` is the lexical match — which would reintroduce ADR 11's exact failure through the provider's mechanism instead of ours.
+
+**Neither tool takes a `user_id`.** The orchestrator binds the user, session, and trace onto the registry before the loop starts (`for_turn`), and the schemas carry no such field. A `user_id` the model fills in is one it can get wrong or be argued into changing, and the blast radius of that is one user's memory written into another's.
 
 ### 7.3 Modes
 

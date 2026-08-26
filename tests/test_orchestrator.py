@@ -192,3 +192,30 @@ class TestSSEFraming:
         client reading the stream."""
         body = sse("token", {"text": "a\nb"}).split("data: ")[1]
         assert body.count("\n") == 2  # the two that terminate the frame
+
+
+class TestMemoryRetrievalEvents:
+    """Memory is neither retrieval substrate."""
+
+    @pytest.mark.parametrize("name", ["memory_search", "memory_write"])
+    def test_memory_tools_emit_no_retrieval_event(self, name):
+        """A remembered pull request must not enter this turn's result set. If
+        it did, §11.2's second citation check would start passing for entities
+        the agent never actually looked up — which is the exact failure that
+        check exists to catch."""
+        assert _retrieval_event(outcome(name, [chunk()])) is None
+
+
+class TestMemoryBlockPlacement:
+    """ADR 8 and §9. The block's *position* is the whole decision, and getting
+    it wrong costs a cache hit on every session with no other symptom."""
+
+    def test_the_system_prompt_never_carries_the_block(self):
+        """In the system prompt the block would invalidate the cached prefix on
+        every new session. The breakpoint is on system[0] and must stay stable
+        across sessions."""
+        from app.orchestrator import SYSTEM_PROMPT
+
+        assert "[semantic" not in SYSTEM_PROMPT
+        assert "[episodic" not in SYSTEM_PROMPT
+        assert "{" not in SYSTEM_PROMPT  # no interpolation slot at all

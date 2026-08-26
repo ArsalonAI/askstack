@@ -9,7 +9,7 @@ tool set that reorders between runs, and an embedding built from the wrong text.
 import pytest
 
 from app.interfaces import ToolDef
-from app.tools.registry import BY_NAME, CATALOG
+from app.tools.registry import ALWAYS_INJECTED, BY_NAME, CATALOG
 from app.tools.selector import (
     NATIVE_SEARCH_TOOL,
     FullToolSelector,
@@ -79,11 +79,26 @@ class TestFullMode:
 
 
 class TestNativeMode:
-    def test_defers_everything_except_one_tool(self):
-        """The API rejects a request in which every tool is deferred."""
+    def test_defers_everything_except_the_loaded_set(self):
+        """The API rejects a request in which every tool is deferred, so the
+        anchor stays loaded — and so do the always-injected memory tools."""
         extra = NativeToolSelector(CATALOG).extra_request_params()
-        assert NativeToolSelector.ALWAYS_LOADED not in extra["defer"]
-        assert len(extra["defer"]) == len(CATALOG) - 1
+        loaded = {NativeToolSelector.ALWAYS_LOADED, *ALWAYS_INJECTED}
+        assert not loaded & set(extra["defer"])
+        assert len(extra["defer"]) == len(CATALOG) - len(loaded)
+
+    def test_memory_tools_are_never_deferred(self):
+        """ADR 11's failure mode, reintroduced by the provider's mechanism
+        instead of ours: nobody phrases a question so that `memory_write` is
+        the BM25 match, so a deferred memory tool never loads."""
+        extra = NativeToolSelector(CATALOG).extra_request_params()
+        assert not set(ALWAYS_INJECTED) & set(extra["defer"])
+
+    def test_a_catalog_without_memory_defers_all_but_the_anchor(self):
+        """Memory off: nothing to keep loaded but the anchor."""
+        catalog = tuple(t for t in CATALOG if t.name not in ALWAYS_INJECTED)
+        extra = NativeToolSelector(catalog).extra_request_params()
+        assert len(extra["defer"]) == len(catalog) - 1
 
     def test_adds_the_provider_search_tool(self):
         extra = NativeToolSelector(CATALOG).extra_request_params()
