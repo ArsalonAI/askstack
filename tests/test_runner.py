@@ -212,3 +212,49 @@ class TestAlwaysInjectedExclusion:
         scored = {t for t in selected if t not in ALWAYS_INJECTED}
         assert jaccard(scored, {"pr_state"}) == 1.0
         assert jaccard(selected, {"pr_state"}) == pytest.approx(1 / 3)
+
+
+class TestGenerationRate:
+    """§13's latency budget is a statement about output volume.
+
+    Measured on the M4 run, latency is 0.6s fixed + 17.3ms per output token —
+    generation is essentially the whole turn. The rate is what converts a
+    seconds budget into a token ceiling, which is the number anyone can act on.
+    """
+
+    def test_it_is_tokens_over_seconds(self):
+        from evals.runner import generation_rate
+
+        assert generation_rate([1000], [60]) == pytest.approx(60.0)
+
+    def test_it_takes_the_median_not_the_ratio_of_sums(self):
+        """One very long turn would otherwise dominate and report the slowest
+        case as the typical one."""
+        from evals.runner import generation_rate
+
+        # Two fast turns at 100 tok/s, one slow outlier at 10 tok/s.
+        rate = generation_rate([1000, 1000, 10_000], [100, 100, 100])
+        assert rate == pytest.approx(100.0)
+
+    def test_zero_length_turns_do_not_divide_by_zero(self):
+        from evals.runner import generation_rate
+
+        assert generation_rate([0, 1000], [0, 50]) == pytest.approx(50.0)
+
+    def test_an_empty_run_reports_zero_rather_than_raising(self):
+        from evals.runner import generation_rate
+
+        assert generation_rate([], []) == 0.0
+
+    def test_mismatched_inputs_raise_rather_than_silently_truncating(self):
+        """`zip` without `strict` would pair a latency with another turn's
+        token count and report a plausible wrong rate."""
+        from evals.runner import generation_rate
+
+        with pytest.raises(ValueError):
+            generation_rate([1000, 2000], [50])
+
+    def test_the_budget_constant_matches_the_spec(self):
+        from evals.runner import LATENCY_BUDGET_MS
+
+        assert LATENCY_BUDGET_MS == 25_000  # §13: "Full response, p95 < 25 s"
