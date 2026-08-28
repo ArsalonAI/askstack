@@ -1275,7 +1275,51 @@ The gate fails if `current < baseline - tolerance` for any gated metric. Improve
 
 **`milestone` is part of the identity, alongside `config_hash`.** The M1 baseline carries only `aggregate_set_f1`, `recall_at_5`, and `mrr_at_10`; the M2 baseline adds `tool_accuracy_*` and `citation_resolution` and reinterprets set-F1 per §14.1. Two baselines with different milestones measure different systems and comparing them is meaningless — the same argument §14.2 makes for keeping `corpus_ref` and `embedding_model` inside the hash. A comparison across milestones is an error, not a regression.
 
-### 14.4 Workflows
+### 14.4 What needs a model, and what does not
+
+The ablation matrix as specced is 12 cells × 50 agent turns, and the scaling sweep is another 12. Priced against the measured M2 cost of **$0.128 per agent question**, that is **$94 + $172 = $266 per run** — and PRD §7.4 asked for it nightly, which is roughly **$8,000 a month** to re-measure a system that changes weekly at most.
+
+That number forced a question worth asking anyway: *which of these metrics actually need a model in the loop?* The answer is fewer than half, and the split is not a budget compromise — it is the same argument §14.1 already makes for keeping the direct-call runner after M2. **A measurement should run through the agent only when the agent is the thing under test.**
+
+| Measurement | Needs an agent? | Why |
+|---|:--:|---|
+| recall@5, MRR@10 | no | Properties of the retriever. Already measured directly (§14.1). |
+| Aggregate set-F1 on the direct path | no | Dispatches the same SQL the tool dispatches. |
+| Hybrid on/off (**axis A**) | no | Both arms are retriever configurations. Free. |
+| Tool-selection accuracy at any catalog size (**axis C**) | no | The selector is a pgvector query over `tool_defs` using a *local* embedding model. |
+| Prompt cost at any catalog size | no | Tool payloads serialise deterministically (§10 sorts by name), so token count is a property of the catalog. |
+| Turns to success, memory on/off (**axis B**) | **yes** | The claim is about what a *model* does with remembered context across sessions. |
+| Citation resolution, answer quality | **yes** | Properties of a generated answer. |
+
+`evals/sweep.py` implements the free half. It reproduces with no API key, no network, and no cost, which is the property §14.4's workflows already wanted from the retrieval metrics and can now have from the scaling curve too. The paid surface shrinks to two things: one golden-set baseline per milestone, and the cross-session suite.
+
+**What this gives up, stated plainly.** The matrix no longer measures *interactions* between axes — whether hybrid retrieval helps more when memory is on, say. Those cells are not free and are not run. Each axis is measured against the default configuration of the other two, which is one-factor-at-a-time, and a reader should not infer additivity from it.
+
+### 14.5 The tool-scaling curve
+
+`python evals/sweep.py` — no key required. Synthetic padding comes from `scripts/gen_synthetic_tools.py`, generated from templates rather than from a model: §7.4 asks for "plausible tool definitions from adjacent domains" and says nothing about how they are made, and a curve claiming something about 500 tools is only checkable if they are the *same* 500 next time. Sizes are prefix-stable — the 50-tool point is the first 50 of the 500 — so the curve cannot confound catalog size with catalog composition.
+
+Measured at `k=5`, `bge-small-en-v1.5`, over the 41 golden questions carrying `gold_tools`:
+
+| catalog | tool recall | crowd-out | real tools offered (of k=5) | semantic prompt | full prompt |
+|---:|---:|---:|---:|---:|---:|
+| 13 | 0.820 | 0.000 | 4.48 | 1,089 | 2,148 |
+| 50 | 0.800 | 0.096 | 4.06 | 1,089 | 8,261 |
+| 200 | 0.570 | 0.452 | 2.46 | 1,089 | 33,046 |
+| 500 | 0.530 | 0.576 | 1.94 | 1,089 | 82,615 |
+
+**PRD §5.4's cost claim holds completely and its accuracy claim does not.** The prompt stays flat at 1,089 tokens while the catalog grows 38×; full exposure grows with it to 82,615, so at 500 tools semantic selection saves **81,526 input tokens per request** — about $0.41 each. That half of the thesis is not in doubt.
+
+Tool recall over the same range falls from **0.820 to 0.530**. The mechanism is in the `crowd-out` column and is not subtle: at 500 tools, **57.6% of the top-5 is synthetic distractors**. Those rows win slots on cosine similarity and are then dropped by the selector as non-dispatchable, so the model is offered **1.94 real tools where `k` promised 5** — and the gold tool that was displaced is simply absent. Cheap prompts, half the right answers.
+
+**This is §17 Q9 arriving as a headline rather than a footnote.** That entry recorded that `bge-small-en-v1.5` puts gold tools at median cosine 0.556 and non-gold at 0.510 — a band far too narrow to separate 13 tools, let alone 500. At 13 tools a narrow band is survivable because there is almost nothing to confuse; at 500 it is fatal. The floor cannot fix it (junk's ceiling is gold's median), and `k` cannot fix it (the distractors outrank the answer). The honest reading is that **semantic tool retrieval as built solves the prompt-cost problem and does not yet solve the selection problem at scale**, and that a better-separating embedding model behind the ADR 2 swap point is the load-bearing next experiment rather than a tuning exercise.
+
+Two measurement caveats, both real:
+
+- **`native` mode has no accuracy column.** Its filtering happens server-side inside Anthropic's tool-search tool (ADR 9), so there is nothing local to score, and scoring it means one paid agent run per catalog size. Its prompt-size column is exact and is plotted; its accuracy is unmeasured and is not claimed.
+- **The crowd-out rate is an artefact of the synthetic tools being non-dispatchable**, which is what makes them clean distractors. A real 500-tool catalog would have 500 dispatchable tools, and the failure would show up as *wrong tool called* rather than *no tool offered*. The recall number is the right one either way; the mechanism would look different.
+
+### 14.6 Workflows
 
 `.github/workflows/eval-pr.yml` — on pull request:
 
@@ -1284,11 +1328,25 @@ The gate fails if `current < baseline - tolerance` for any gated metric. Improve
 3. Compare to `main.json`; fail on breach.
 4. Post a metrics table as a PR comment either way.
 
-`.github/workflows/eval-nightly.yml` — on schedule:
+`.github/workflows/eval-sweep.yml` — on pull requests that touch the selector,
+the catalog, or the embedder; and on a weekly schedule:
 
-1. Full 12-cell matrix plus the tool-scaling sweep (15 / 50 / 200 / 500).
-2. Cross-session scenario suite, memory on vs. off.
-3. Publish a markdown report and a plot artifact. Never blocks.
+1. `evals/sweep.py` over 13 / 50 / 200 / 500. **No API key, no cost.**
+2. Publish the curve and a plot artifact. Never blocks.
+
+Runs on change rather than nightly because it *is* deterministic: with a fixed
+embedding model and prefix-stable padding (§14.5) it returns the same numbers
+every night, and a job that cannot change its answer overnight has no business
+running overnight.
+
+`.github/workflows/eval-cross-session.yml` — manual dispatch, and on release:
+
+1. The cross-session suite, memory on vs. off — the only paid ablation (§14.4).
+2. Publish turns-to-success. Never blocks.
+
+Manual rather than scheduled because it is the one recurring cost that cannot
+be designed away, and because PRD §7.2's ten scenarios move only when the
+scenarios or the memory pipeline do.
 
 Only the LLM-judge and agent calls need network. Embeddings are local, so the retrieval metrics are fully deterministic — a recall@5 change is always a real change, never judge noise.
 
@@ -1328,6 +1386,7 @@ Only the LLM-judge and agent calls need network. Embeddings are local, so the re
 | 15 | Counts rendered deterministically in code | A model asked to summarise forty PRs produces a confident wrong total, and the manager cannot tell | LLM-summarised aggregates — fluent, unverifiable, and wrong often enough to poison trust in every other answer |
 | 16 | `areas.yaml` hand-authored | "The payments module" has no reliable signal in the file tree; a wrong auto-derived mapping corrupts every ownership answer invisibly | Heuristics over directory names or the import graph — plausible-looking and wrong in ways nobody notices |
 | 17 | Facts layer rebuilt, not versioned | GitHub is the system of record; a second history here would go stale differently from the first | Versioning entities like `memories` — duplicate state, no added attribution value |
+| 18 | A measurement runs through the agent only when the agent is what is under test | The scaling curve and the hybrid axis are properties of the retriever and the selector; measuring them through a paid agent turn added cost and noise without adding information, and priced the nightly matrix at ~$8k/month | Running the full 12-cell matrix and sweep through the agent (faithful to §7.3, unaffordable, and slower to reproduce); a cheaper model for eval runs (changes what is measured, and makes the numbers incomparable to the production configuration) |
 
 ---
 
