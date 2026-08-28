@@ -1,0 +1,73 @@
+name: tests
+
+# Everything here runs without an API key. That is not an accident: TRD §14.4
+# splits the eval surface into what needs a model and what does not, and the
+# half that does not is the half worth running on every push. A contributor
+# with no Anthropic credentials can still get a green build.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        # pgvector is not optional — the schema declares VECTOR(384) columns and
+        # HNSW indexes, so a stock postgres image fails at migration rather than
+        # at the first query.
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: askstack
+          POSTGRES_PASSWORD: askstack
+          POSTGRES_DB: askstack
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U askstack"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://askstack:askstack@localhost:5432/askstack
+      # The suite creates and drops `askstack_test` itself (tests/conftest.py),
+      # so the role needs CREATEDB. The postgres image's superuser has it.
+      ANTHROPIC_API_KEY: ""
+      HF_HUB_DISABLE_TELEMETRY: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      # ~130 MB of weights, downloaded once and reused. Without this every run
+      # re-fetches the embedding model, which dominates wall time.
+      - name: Cache the embedding model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ hashFiles('pyproject.toml') }}
+
+      - name: Lint
+        run: uv run ruff check app evals tests scripts
+
+      - name: Migrate
+        run: uv run alembic -c scripts/migrations/alembic.ini upgrade head
+
+      - name: Test
+        run: uv run pytest -q
