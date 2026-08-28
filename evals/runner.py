@@ -63,6 +63,15 @@ from evals.build_gold import (  # noqa: E402
 # §14.3. Only the three retrieval metrics exist at M1; the M2 baseline adds
 # tool_accuracy_* and citation_resolution.
 MILESTONE = "M1"
+
+# The milestone the *agent* path measures, and part of the baseline's identity
+# alongside `config_hash` (§14.3). It is a separate constant because the config
+# hash cannot tell these apart: `memory_enabled` was already `true` at M2 by
+# default, before memory existed, so the M2 and M4 baselines share the digest
+# `d487120aa413` while measuring materially different systems. Bump this when
+# the agent path gains a capability, or the file will claim to describe the
+# previous one — which it did, hardcoded to "M2", for exactly one commit.
+AGENT_MILESTONE = "M4"
 TOLERANCES = {
     "aggregate_set_f1": 0.02,
     "recall_at_5": 0.02,
@@ -479,6 +488,39 @@ async def run_agent_path(
     return [*cached.values(), *fresh]
 
 
+async def assert_catalog_matches_config(conn) -> None:
+    """The database must agree with the config the hash is computed from.
+
+    §14.2 says the hash identifies an eval cell, and it is built from
+    `settings` — but the selector reads `tool_defs`, and nothing kept the two
+    in step. `evals/sweep.py` pads that table to 500 tools and leaves it
+    padded; a baseline recorded afterwards would have the agent choosing from
+    500 tools while its own `config_hash` records `tool_catalog_size: 0`.
+    Every number in the file would be real, and the label on it would be
+    wrong — which is worse than a crash, because it is quotable.
+
+    Checked here rather than in the sweep because this is where the cost is: a
+    fifty-question agent run is money, and discovering the mismatch afterwards
+    means spending it twice.
+    """
+    from app.tools.registry import CATALOG
+
+    total = await conn.fetchval("SELECT count(*) FROM tool_defs")
+    synthetic = await conn.fetchval(
+        "SELECT count(*) FROM tool_defs WHERE is_synthetic"
+    )
+    expected = settings.tool_catalog_size or len(CATALOG)
+    if total == expected:
+        return
+    raise ValidationError(
+        f"tool_defs holds {total} tools ({synthetic} synthetic) but "
+        f"TOOL_CATALOG_SIZE implies {expected}. A run now would measure a "
+        f"catalog the config hash does not describe.\n"
+        f"  fix: python scripts/gen_synthetic_tools.py --size "
+        f"{settings.tool_catalog_size or 0}"
+    )
+
+
 def config_hash(pin: dict) -> tuple[str, dict]:
     """§14.2. `corpus_ref` is the resolved ref, not the symbolic name."""
     config = {
@@ -743,6 +785,16 @@ async def main(argv: list[str] | None = None) -> int:
             # correctly by any system, so the whole run aborts rather than
             # reporting a number that reads as a retrieval regression.
             errors = await validate(conn, questions, pin)
+            # Before anything is spent. An agent run costs real money and a
+            # mismatched catalog invalidates every question in it. Reported
+            # like any other precondition failure rather than as a traceback —
+            # the message carries the fix, and a stack trace buries it.
+            if args.agent:
+                try:
+                    await assert_catalog_matches_config(conn)
+                except ValidationError as exc:
+                    print(f"\n{exc}", file=sys.stderr)
+                    return 1
         if errors:
             print(f"{len(errors)} problem(s) in {QUESTIONS.name}:", file=sys.stderr)
             for error in errors:
@@ -800,7 +852,7 @@ async def main(argv: list[str] | None = None) -> int:
                 explain(by_id[result.qid], result)
             return 0
 
-        milestone = "M2" if args.agent else MILESTONE
+        milestone = AGENT_MILESTONE if args.agent else MILESTONE
         results.sort(key=lambda r: r.qid)
         metrics = aggregate(results)
         digest, _ = config_hash(pin)

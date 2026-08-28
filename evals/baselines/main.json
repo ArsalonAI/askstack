@@ -1,17 +1,17 @@
 {
-  "milestone": "M2",
+  "milestone": "M4",
   "config_hash": "d487120aa413",
-  "git_sha": "483fa6d213b85dcbf28db3db4daf12f6d8a551bd",
+  "git_sha": "3510f4f244923d32877cd59e1cc859f409bcbcf0",
   "corpus_ref": "master@95f8322ee1dc",
-  "recorded_at": "2026-08-26T03:57:05.384270Z",
+  "recorded_at": "2026-08-28T16:52:05.635481Z",
   "metrics": {
-    "aggregate_set_f1": 0.8087,
-    "recall_at_5": 0.175,
-    "mrr_at_10": 0.2244,
-    "aggregate_set_f1_union": 0.7483,
-    "tool_accuracy_jaccard": 0.1747,
+    "aggregate_set_f1": 0.7993,
+    "recall_at_5": 0.1417,
+    "mrr_at_10": 0.1626,
+    "aggregate_set_f1_union": 0.6943,
+    "tool_accuracy_jaccard": 0.1857,
     "tool_accuracy_exact": 0.0,
-    "citation_resolution": 0.9873
+    "citation_resolution": 0.9884
   },
   "tolerances": {
     "aggregate_set_f1": 0.02,

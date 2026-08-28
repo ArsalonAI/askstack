@@ -1275,6 +1275,22 @@ The gate fails if `current < baseline - tolerance` for any gated metric. Improve
 
 **`milestone` is part of the identity, alongside `config_hash`.** The M1 baseline carries only `aggregate_set_f1`, `recall_at_5`, and `mrr_at_10`; the M2 baseline adds `tool_accuracy_*` and `citation_resolution` and reinterprets set-F1 per §14.1. Two baselines with different milestones measure different systems and comparing them is meaningless — the same argument §14.2 makes for keeping `corpus_ref` and `embedding_model` inside the hash. A comparison across milestones is an error, not a regression.
 
+**M2 and M4 share a `config_hash`, and that is the field doing the work.** Both are `d487120aa413`: `memory_enabled` defaulted to `true` at M2, before memory existed, so no hash input changed while the system gained a Memory Manager, extraction, consolidation, and two always-injected tools. The hash is computed from `settings`, and a setting that was aspirational at M2 became load-bearing at M3 without moving. `milestone` is therefore the only field that distinguishes them, which is exactly the case it was added for — and `AGENT_MILESTONE` in the runner is a named constant rather than a literal because it was hardcoded to `"M2"` and silently mislabelled the M4 file on its first write.
+
+**The golden set cannot measure memory's benefit, by construction.** Each question runs under its own `eval_{qid}` user with no prior session, so the memory block is empty for all fifty — measured: 50 sessions, 0 memories. That isolation is deliberate (§14.1: a question scored against context from an unrelated question is not the question the set froze), and it means the M4 baseline records the *cost* of memory with none of its benefit: two extra tools in the prompt, an empty block, one more round trip.
+
+The M2 → M4 deltas are what that predicts, and should be read as the price rather than as a regression:
+
+| metric | M2 | M4 | Δ |
+|---|---:|---:|---:|
+| `aggregate_set_f1` | 0.8087 | 0.7993 | −0.009 |
+| `recall_at_5` | 0.1750 | 0.1417 | −0.033 |
+| `mrr_at_10` | 0.2244 | 0.1626 | −0.062 |
+| `tool_accuracy_jaccard` | 0.1747 | 0.1857 | +0.011 |
+| `citation_resolution` | 0.9873 | 0.9884 | +0.001 |
+
+Memory's benefit is measured by the cross-session suite (PRD §7.2) and nowhere else. Reporting these two together is the only honest read of the architecture: the golden set prices it, the scenario suite values it, and at present neither shows it paying for itself.
+
 ### 14.4 What needs a model, and what does not
 
 The ablation matrix as specced is 12 cells × 50 agent turns, and the scaling sweep is another 12. Priced against the measured M2 cost of **$0.128 per agent question**, that is **$94 + $172 = $266 per run** — and PRD §7.4 asked for it nightly, which is roughly **$8,000 a month** to re-measure a system that changes weekly at most.
