@@ -10,6 +10,7 @@ import json
 import pytest
 
 from app.tools.registry import ALWAYS_INJECTED
+from evals.build_gold import ValidationError
 from evals.runner import (
     CACHE_FORMAT,
     _load_cache,
@@ -212,3 +213,54 @@ class TestAlwaysInjectedExclusion:
         scored = {t for t in selected if t not in ALWAYS_INJECTED}
         assert jaccard(scored, {"pr_state"}) == 1.0
         assert jaccard(selected, {"pr_state"}) == pytest.approx(1 / 3)
+
+
+class TestCatalogPrecondition:
+    """The config hash is computed from `settings`; the selector reads
+    `tool_defs`. Nothing kept the two in step.
+
+    `evals/sweep.py` pads that table to 500 tools and used to leave it padded.
+    A baseline recorded afterwards would have had the agent choosing from 500
+    tools while its own `config_hash` recorded `tool_catalog_size: 0` — every
+    number real, the label on them wrong, and quotable. This was caught with
+    487 synthetic tools sitting in the table and a $9 run about to start.
+    """
+
+    def test_the_check_is_reachable_from_the_runner(self):
+        from evals.runner import assert_catalog_matches_config
+
+        assert callable(assert_catalog_matches_config)
+
+    async def test_a_matching_catalog_passes(self):
+        from app.tools.registry import CATALOG
+        from evals.runner import assert_catalog_matches_config
+
+        await assert_catalog_matches_config(_CountingConn(len(CATALOG), 0))
+
+    async def test_a_padded_catalog_raises_with_the_fix_in_the_message(self):
+        """An error that does not say how to fix it costs a search."""
+        from evals.runner import assert_catalog_matches_config
+
+        with pytest.raises(ValidationError) as caught:
+            await assert_catalog_matches_config(_CountingConn(500, 487))
+        message = str(caught.value)
+        assert "500" in message and "487" in message
+        assert "gen_synthetic_tools.py" in message
+
+    async def test_an_undersized_catalog_also_raises(self):
+        """A missing tool is as wrong as an extra one — it means the seed never
+        ran, and the selector silently cannot surface what it lacks."""
+        from evals.runner import assert_catalog_matches_config
+
+        with pytest.raises(ValidationError):
+            await assert_catalog_matches_config(_CountingConn(4, 0))
+
+
+class _CountingConn:
+    """Answers the two counts `assert_catalog_matches_config` asks for."""
+
+    def __init__(self, total: int, synthetic: int):
+        self._answers = [total, synthetic]
+
+    async def fetchval(self, query, *args):
+        return self._answers.pop(0)

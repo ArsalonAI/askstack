@@ -289,7 +289,20 @@ async def main(argv: list[str] | None = None) -> int:
                 flush=True,
             )
     finally:
-        await conn.close()
+        # Restore the catalog the rest of the system expects. The sweep borrows
+        # `tool_defs` and pads it to 500; leaving it padded means the next
+        # agent run selects from a catalog its own config hash does not
+        # describe. `evals/runner.py` now refuses such a run outright, but the
+        # borrower should put the table back rather than relying on the next
+        # caller to notice.
+        try:
+            await _repad(conn, embedder, settings.tool_catalog_size or len(CATALOG))
+            print(
+                f"  restored tool_defs to {settings.tool_catalog_size or len(CATALOG)}",
+                file=sys.stderr,
+            )
+        finally:
+            await conn.close()
 
     print_curve(points)
     if args.json:
