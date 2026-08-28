@@ -1158,6 +1158,24 @@ Latency decomposes into the time-to-first-token target rather than being a list 
 | Full corpus ingest (~40k chunks, laptop CPU) | < 30 min |
 | Per-PR eval gate wall time | < 15 min |
 
+**The p95 latency target is measured and is not met.** On the M4 run: p50 **20.4 s**, p95 **45.9 s**, max 82.4 s, with **17 of 50 turns over budget**. That has been noted three times without being diagnosed; it is diagnosed here.
+
+Latency is almost entirely token generation. Correlations against turn latency: output tokens **+0.92**, tool calls **+0.86**, input tokens **+0.88** — and a linear fit gives
+
+> latency ≈ **0.6 s fixed + 17.3 ms per output token**, i.e. ~59 output tokens/second sustained.
+
+Fixed overhead is negligible, so the §12 span budgets above (`tools.select` 100 ms, `retrieve.*` 300 ms) are not where the time goes and tuning them would recover nothing. Tool calls correlate only because each additional loop iteration generates more output; the calls themselves are not the cost.
+
+That turns the budget into a statement about output volume: **25 s at 59 tok/s is a ceiling of ~1,485 output tokens**. Measured output is median 1,208 — under it — but p95 is **2,911**, nearly double. The budget and the configuration are therefore inconsistent by roughly 2×, and it is the *tail* that breaks it, not the typical turn.
+
+Three ways out, and the choice is a product decision rather than a tuning one:
+
+- **Lower `agent_effort`.** ADR 7 makes `effort` the cost lever; it is the latency lever for the same reason, since both are functions of tokens generated. This trades directly against the quality metrics in §14.3 and is not a free win — it needs a measured run at `medium`, which is one paid baseline.
+- **Raise the target.** 25 s was written before the agent existed and never reconciled with a measured generation rate. A p95 of ~50 s may simply be what this shape of agent costs at `high` effort.
+- **Cap the tail.** The breach is 17 turns, concentrated in class 1 and class 5 questions that make 4–10 tool calls. `MAX_ITERATIONS` is 8; lowering it would truncate exactly the turns that currently answer hardest.
+
+Unresolved deliberately: each option moves a number someone else is reading, and picking one without measuring the trade would be choosing the metric that flatters. The runner now prints the implied output ceiling alongside the breach so the trade is visible at the point of measurement.
+
 Every one of these maps to a span or attribute in §12, so they are observable rather than aspirational. The budget is demo-grade — a single laptop, local embeddings, five concurrent sessions. Production targets would force connection-pool tuning and an embedding service into this document; they are deferred until there is a reason for them.
 
 ---

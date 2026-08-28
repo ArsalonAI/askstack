@@ -30,6 +30,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import statistics
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -78,6 +79,9 @@ TOLERANCES = {
 #   3 — §7.2.2's always-injected exclusion from tool accuracy, which arrives
 #       with memory at M3 and changes the denominator
 CACHE_FORMAT = 3
+
+# §13's p95 budget, in the units the runner measures.
+LATENCY_BUDGET_MS = 25_000
 
 RECALL_K = 5
 MRR_K = 10
@@ -494,6 +498,26 @@ def config_hash(pin: dict) -> tuple[str, dict]:
     return digest, config
 
 
+def generation_rate(latencies_ms: list[int], output_tokens: list[int]) -> float:
+    """Median sustained output tokens per second across a run.
+
+    Reported because it is what turns §13's latency budget into an actionable
+    number. Measured on the M4 run, latency is `0.6s + 17.3ms per output
+    token` — fixed overhead is negligible and generation is essentially the
+    whole turn, so "make it faster" means "generate less", and the lever is
+    `effort` (ADR 7) rather than concurrency.
+
+    Median rather than total-over-total: one very long turn would otherwise
+    dominate a ratio of sums and report the slowest case as the typical one.
+    """
+    rates = [
+        tok / (ms / 1000)
+        for ms, tok in zip(latencies_ms, output_tokens, strict=True)
+        if ms > 0 and tok > 0
+    ]
+    return statistics.median(rates) if rates else 0.0
+
+
 def _mean(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
 
@@ -621,8 +645,27 @@ def report(
         if latencies and latencies[-1]:
             p95 = latencies[int(0.95 * (len(latencies) - 1))]
             print(f"\n  cost ${cost:.2f} total, ${cost / max(len(results), 1):.3f}/question")
+            over = sum(1 for ms in latencies if ms > LATENCY_BUDGET_MS)
             print(f"  latency p50 {latencies[len(latencies) // 2] / 1000:.1f}s "
                   f"p95 {p95 / 1000:.1f}s   (§13 budget: 25s p95)")
+            if p95 > LATENCY_BUDGET_MS:
+                # §13's budget is a *product* requirement, so a breach is worth
+                # stating in the terms that decide it. Latency here is almost
+                # entirely token generation (§13, measured): the budget implies
+                # an output ceiling, and that ceiling is the actionable number.
+                tokens = [
+                    (r.agent or {}).get("usage", {}).get("usage", {}).get(
+                        "output_tokens", 0
+                    )
+                    for r in results
+                ]
+                rate = generation_rate(latencies, tokens)
+                print(
+                    f"  over budget: {over}/{len(latencies)} turns. At "
+                    f"{rate:.0f} output tok/s the 25s budget implies "
+                    f"≤{25 * rate:.0f} output tokens; p95 output is "
+                    f"{sorted(tokens)[int(0.95 * (len(tokens) - 1))]}."
+                )
 
         missed = [r for r in results if r.metrics.get("tool_jaccard", 1.0) == 0.0]
         if missed:
