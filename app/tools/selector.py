@@ -20,6 +20,7 @@ from typing import Any
 import asyncpg
 
 from app.interfaces import Embedder, ToolDef
+from app.tools.registry import ALWAYS_INJECTED
 
 # §7.2. The floor matters more than k: without it a query like "hi" returns
 # five arbitrary tools at ~0.05 similarity and the model is invited to call
@@ -81,6 +82,29 @@ def to_api_tools(tools: Sequence[ToolDef], *, deferred: Sequence[str] = ()) -> l
             entry["defer_loading"] = True
         payload.append(entry)
     return payload
+
+
+def always_injected(catalog: Sequence[ToolDef]) -> list[ToolDef]:
+    """The tools that bypass selection entirely — §7.2.2, ADR 11.
+
+    Their relevance is never expressed in the user's query. Nobody types
+    "please save this to memory", so semantic retrieval would never surface
+    `memory_write` and the write-back loop would silently never fire — the
+    feature would be architecturally clean and functionally absent.
+
+    Intersected with the caller's catalog rather than asserted, so a run with
+    memory disabled (whose registry omits both tools) injects nothing and the
+    off arm measures a system without memory.
+    """
+    return [t for t in catalog if t.name in ALWAYS_INJECTED]
+
+
+def _with_always_injected(
+    selected: Sequence[ToolDef], catalog: Sequence[ToolDef]
+) -> list[ToolDef]:
+    chosen = {t.name for t in selected}
+    extra = [t for t in always_injected(catalog) if t.name not in chosen]
+    return sorted([*selected, *extra], key=lambda t: t.name)
 
 
 class FullToolSelector:
@@ -159,7 +183,10 @@ class SemanticToolSelector:
                     score=float(row["score"]),
                 )
             )
-        return sorted(selected, key=lambda t: t.name)
+        # §7.2.2. Added after the top-k, not counted against it: `k` bounds how
+        # many tools retrieval chose, and spending one of those slots on a tool
+        # that was never a candidate would make the arm look worse than it is.
+        return _with_always_injected(selected, self._by_name.values())
 
     def extra_request_params(self) -> dict:
         return {}
@@ -188,8 +215,14 @@ class NativeToolSelector:
         return sorted(self._catalog, key=lambda t: t.name)
 
     def extra_request_params(self) -> dict:
+        # The memory tools are never deferred. Deferring them would put them
+        # behind a BM25 search the model has no reason to run — nobody phrases
+        # a question so that "memory_write" is the matching tool — which is
+        # ADR 11's failure mode reintroduced by the provider's mechanism
+        # instead of ours.
+        loaded = {self.ALWAYS_LOADED, *(t.name for t in always_injected(self._catalog))}
         return {
-            "defer": [t.name for t in self._catalog if t.name != self.ALWAYS_LOADED],
+            "defer": [t.name for t in self._catalog if t.name not in loaded],
             "extra_tools": [NATIVE_SEARCH_TOOL],
         }
 

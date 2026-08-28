@@ -163,7 +163,13 @@ Plus a scaling sweep across catalog sizes, which is the plot that carries §5.4.
 
 ### 7.4 CI policy
 
-Per pull request, the default configuration runs against the full golden set and is compared to a committed baseline. Any gated metric falling outside tolerance fails the build. The full ablation matrix and scaling sweep run nightly and never block.
+Per pull request, the default configuration runs against the full golden set and is compared to a committed baseline. Any gated metric falling outside tolerance fails the build.
+
+**The matrix and the sweep no longer run nightly, because most of them no longer need a model.** Priced against the measured per-question agent cost, running both through the agent every night came to roughly $8,000 a month to re-measure a system that changes weekly at most. That forced a question worth asking regardless of budget: which of these metrics actually need an agent in the loop? Fewer than half. Hybrid retrieval, tool-selection accuracy at any catalog size, and prompt cost at any catalog size are all properties of the retriever and the selector, and are now measured directly — deterministically, with no API key, at no cost. The scaling curve runs on any change to the selector, catalog, or embedder rather than on a schedule, because with a fixed embedding model it returns the same numbers every night and a job that cannot change its answer overnight has no business running overnight. TRD §14.4 has the full split and ADR 18 the reasoning.
+
+The one axis that genuinely needs a model is memory, because the claim is about what a model does with remembered context across sessions. That is the cross-session suite, run on demand.
+
+The cost of this is stated rather than hidden: the matrix no longer measures *interactions* between axes. Each is measured against the default configuration of the other two, which is one-factor-at-a-time, and additivity should not be inferred from it.
 
 Baselines change only through an explicit pull request that states why. A regression must never be absorbable by regenerating the baseline in the commit that caused it.
 

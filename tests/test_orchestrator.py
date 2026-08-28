@@ -17,6 +17,7 @@ from app.orchestrator import (
     Turn,
     _retrieval_event,
     _wire_block,
+    replayable,
     sse,
 )
 from app.tools.registry import ToolOutcome
@@ -192,3 +193,125 @@ class TestSSEFraming:
         client reading the stream."""
         body = sse("token", {"text": "a\nb"}).split("data: ")[1]
         assert body.count("\n") == 2  # the two that terminate the frame
+
+
+class TestMemoryRetrievalEvents:
+    """Memory is neither retrieval substrate."""
+
+    @pytest.mark.parametrize("name", ["memory_search", "memory_write"])
+    def test_memory_tools_emit_no_retrieval_event(self, name):
+        """A remembered pull request must not enter this turn's result set. If
+        it did, §11.2's second citation check would start passing for entities
+        the agent never actually looked up — which is the exact failure that
+        check exists to catch."""
+        assert _retrieval_event(outcome(name, [chunk()])) is None
+
+
+class TestMemoryBlockPlacement:
+    """ADR 8 and §9. The block's *position* is the whole decision, and getting
+    it wrong costs a cache hit on every session with no other symptom."""
+
+    def test_the_system_prompt_never_carries_the_block(self):
+        """In the system prompt the block would invalidate the cached prefix on
+        every new session. The breakpoint is on system[0] and must stay stable
+        across sessions."""
+        from app.orchestrator import SYSTEM_PROMPT
+
+        assert "[semantic" not in SYSTEM_PROMPT
+        assert "[episodic" not in SYSTEM_PROMPT
+        assert "{" not in SYSTEM_PROMPT  # no interpolation slot at all
+
+
+class TestReplayableHistory:
+    """A stored turn replayed as history must be a valid request.
+
+    Found by the cross-session suite on its first run, not by a unit test: a
+    `tool_use` block was persisted verbatim (correct, §4) with no `tool_result`
+    to follow it, so every second turn that had called a tool returned 400.
+    Single-turn evals never saw it, and the caching test's second turn happened
+    not to call a tool.
+    """
+
+    def test_tool_use_is_dropped_on_replay(self):
+        content = [
+            {"type": "text", "text": "Looking that up."},
+            {"type": "tool_use", "id": "toolu_1", "name": "merged_prs", "input": {}},
+        ]
+        assert replayable(content) == [{"type": "text", "text": "Looking that up."}]
+
+    def test_tool_result_is_dropped_too(self):
+        """The other half of the pair. A result with no preceding use is the
+        same error from the other side."""
+        content = [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "x"}]
+        assert replayable(content) == []
+
+    def test_text_only_content_is_untouched(self):
+        content = [{"type": "text", "text": "PR 15806 did not ship."}]
+        assert replayable(content) == content
+
+    def test_a_plain_string_message_passes_through(self):
+        """User turns are persisted as bare strings, not block lists."""
+        assert replayable("what shipped last month?") == "what shipped last month?"
+
+    def test_thinking_blocks_are_dropped_too(self):
+        """The second half of the same bug, and the reason this is an allowlist.
+
+        Removing `tool_use` from a message that also thought counts as
+        *modifying* the thinking block, which the API rejects on its own — so
+        dropping one without the other just trades a paired-block error for a
+        thinking-block error. The first fix did exactly that.
+        """
+        content = [
+            {"type": "thinking", "thinking": "..."},
+            {"type": "text", "text": "hi"},
+            {"type": "tool_use", "id": "t", "name": "merged_prs", "input": {}},
+        ]
+        assert replayable(content) == [{"type": "text", "text": "hi"}]
+
+
+class TestMemoryIsNotAResultSet:
+    """`memory_search` returns `list[Memory]`, which is a list — and every
+    list-shaped tool result before it was `list[Chunk]`.
+
+    Found by the cross-session suite once extraction made memory non-empty
+    enough for the agent to call `memory_search` at all: `Turn.record` reached
+    for `.citation` on a `Memory` and took the whole turn down. Unit tests
+    could not see it because nothing had ever put a `Memory` on this path.
+    """
+
+    def test_memory_search_results_never_enter_the_result_set(self):
+        turn = Turn()
+        turn.record(outcome("memory_search", [_memory()]))
+        assert turn.span_results == set()
+        assert turn.entity_results == set()
+
+    def test_a_remembered_entity_does_not_resolve_as_looked_up(self):
+        """The reason this matters beyond the crash: memory naming a PR is not
+        the same as the agent having checked it, and §11.2's second half is the
+        only thing that tells them apart."""
+        turn = Turn()
+        turn.record(outcome("memory_search", [_memory("we discussed pr:15806")]))
+        assert "pr:15806" not in turn.entity_results
+
+    def test_memory_write_records_nothing(self):
+        turn = Turn()
+        turn.record(outcome("memory_write", _memory()))
+        assert not turn.span_results and not turn.entity_results
+
+    def test_a_real_search_still_records(self):
+        """The guard must be scoped to memory, not to list results generally."""
+        turn = Turn()
+        turn.record(outcome("search_issues", [chunk()]))
+        assert turn.span_results == {"issue:98#comment-0"}
+
+
+def _memory(content="a fact"):
+    from app.interfaces import Memory
+
+    return Memory(
+        id="mem_1", user_id="u1", mem_type="episodic", content=content,
+        entities=(), confidence=0.8, revision=1,
+        valid_from=datetime(2026, 8, 26, tzinfo=UTC), valid_to=None,
+        created_by="extraction", source_session_id="sess_1", source_ids=(),
+        trace_id=None,
+    )

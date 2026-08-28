@@ -12,8 +12,14 @@ import pytest
 import yaml
 
 from app.facts.areas import UnknownArea
-from app.interfaces import Aggregate, Chunk, Entity
-from app.tools.registry import BY_NAME, CATALOG, ToolRegistry
+from app.interfaces import Aggregate, Chunk, Entity, Memory
+from app.tools.registry import (
+    ALWAYS_INJECTED,
+    BY_NAME,
+    CATALOG,
+    ToolRegistry,
+    coerce,
+)
 
 AS_OF = datetime(2026, 7, 29, tzinfo=UTC)
 
@@ -80,8 +86,55 @@ def entity(kind="pr", ref="15806", state="closed", at=None) -> Entity:
     )
 
 
-def registry(facts=None, retriever=None) -> ToolRegistry:
-    return ToolRegistry(facts or StubFacts(), retriever or StubRetriever())
+class StubMemory:
+    """Stands in for the Manager. Records what it was asked to write, so the
+    tests can assert that the turn binding — not the model — decides whose
+    memory is touched."""
+
+    def __init__(self, found=None) -> None:
+        self.written: list[dict] = []
+        self.searched: list[dict] = []
+        self._found = found or []
+
+    async def record(self, session_id, statement, **kw):
+        self.written.append({"session_id": session_id, "statement": statement, **kw})
+        return _memory(statement)
+
+    async def search(self, user_id, query, *, mem_type=None, k=5):
+        self.searched.append({"user_id": user_id, "query": query, "type": mem_type})
+        return list(self._found)
+
+
+def _memory(content="a fact", mem_type="episodic"):
+    return Memory(
+        id="mem_x",
+        user_id="u1",
+        mem_type=mem_type,
+        content=content,
+        entities=(),
+        confidence=0.8,
+        revision=1,
+        valid_from=AS_OF,
+        valid_to=None,
+        created_by="agent",
+        source_session_id="sess_1",
+        source_ids=(),
+        trace_id=None,
+    )
+
+
+_DEFAULT = object()  # `memory=None` means "memory disabled", not "unspecified"
+
+
+def registry(facts=None, retriever=None, memory=_DEFAULT, *, bind=True) -> ToolRegistry:
+    built = ToolRegistry(
+        facts or StubFacts(),
+        retriever or StubRetriever(),
+        memory=StubMemory() if memory is _DEFAULT else memory,
+    )
+    if bind:
+        built.for_turn("u1", "sess_1", "trace_1")
+    return built
 
 
 class TestCatalog:
@@ -254,6 +307,63 @@ class TestDispatch:
         assert isinstance(outcome.result, Entity)
         assert outcome.result.citation == "pr:15806"
 
+    async def test_memory_write_takes_the_user_from_the_turn_not_the_model(self):
+        """A `user_id` the model fills in is one it can get wrong or be talked
+        into changing, and the blast radius is one user's memory written into
+        another's. The schema deliberately has no such field."""
+        assert "user_id" not in BY_NAME["memory_write"].input_schema["properties"]
+        memory = StubMemory()
+        await registry(memory=memory).dispatch(
+            "memory_write", {"statement": "only auth PRs matter"}, as_of=AS_OF
+        )
+        written = memory.written[0]
+        assert written["user_id"] == "u1"
+        assert written["session_id"] == "sess_1"
+        assert written["trace_id"] == "trace_1"
+
+    async def test_memory_write_defaults_confidence_rather_than_demanding_it(self):
+        memory = StubMemory()
+        await registry(memory=memory).dispatch(
+            "memory_write", {"statement": "x"}, as_of=AS_OF
+        )
+        assert 0.0 <= memory.written[0]["confidence"] <= 1.0
+
+    async def test_memory_search_reports_a_miss_as_a_fact(self):
+        """"Nothing remembered about X" is an answer, and must not read the
+        same as a tool that failed."""
+        outcome = await registry(memory=StubMemory([])).dispatch(
+            "memory_search", {"query": "x"}, as_of=AS_OF
+        )
+        assert not outcome.is_error
+        assert "Nothing in memory" in outcome.rendered
+
+    async def test_memory_search_renders_provenance(self):
+        """§8.5 — the model must be able to discount a memory, which it cannot
+        do if the rendering hides where the memory came from."""
+        outcome = await registry(memory=StubMemory([_memory("asked in July")])).dispatch(
+            "memory_search", {"query": "x"}, as_of=AS_OF
+        )
+        assert "episodic" in outcome.rendered
+        assert "asked in July" in outcome.rendered
+
+    async def test_memory_tools_are_absent_when_memory_is_disabled(self):
+        """The ablation's off arm measures a system without memory, not one
+        with two broken tools in the prompt."""
+        names = {t.name for t in registry(memory=None, bind=False).definitions()}
+        assert not names & set(ALWAYS_INJECTED)
+
+    async def test_calling_a_memory_tool_with_memory_disabled_errors(self):
+        outcome = await registry(memory=None, bind=False).dispatch(
+            "memory_write", {"statement": "x"}, as_of=AS_OF
+        )
+        assert outcome.is_error
+
+    async def test_an_unbound_turn_errors_rather_than_guessing_a_user(self):
+        outcome = await registry(bind=False).dispatch(
+            "memory_write", {"statement": "x"}, as_of=AS_OF
+        )
+        assert outcome.is_error
+
     @pytest.mark.parametrize("name", sorted(BY_NAME))
     async def test_every_tool_dispatches(self, name):
         """A tool in the catalog with no dispatch branch is invisible until a
@@ -270,7 +380,64 @@ class TestDispatch:
             "search_docs": {"query": "x"},
             "search_code": {"query": "x"},
             "search_issues": {"query": "x"},
+            "memory_write": {"statement": "they track the auth workstream"},
+            "memory_search": {"query": "x"},
         }[name]
         outcome = await registry(StubFacts(entity())).dispatch(name, arguments, as_of=AS_OF)
         assert not outcome.is_error, outcome.rendered
         assert outcome.rendered
+
+
+class TestArgumentCoercion:
+    """A tool schema is a request, not a guarantee.
+
+    Without `strict: true` the API does not validate `tool_use.input` against
+    the declared schema. A model that reads "over the last 30 days" will
+    sometimes send `"30"` where the schema says integer, and asyncpg then fails
+    at the driver with `'str' object cannot be interpreted as an integer` —
+    which surfaced as `upstream_unavailable` and killed a whole cross-session
+    scenario, because a type error inside a tool is indistinguishable from the
+    API being down at the point it gets caught.
+    """
+
+    def test_a_stringified_integer_is_coerced(self):
+        assert coerce("stale_prs", {"threshold_days": "30"})["threshold_days"] == 30
+
+    def test_whitespace_is_tolerated(self):
+        assert coerce("stale_prs", {"threshold_days": " 14 "})["threshold_days"] == 14
+
+    def test_an_actual_integer_is_untouched(self):
+        assert coerce("stale_prs", {"threshold_days": 14})["threshold_days"] == 14
+
+    def test_optional_integers_are_coerced_too(self):
+        args = coerce("open_issues", {"older_than_days": "90"})
+        assert args["older_than_days"] == 90
+
+    def test_absent_and_null_fields_are_left_alone(self):
+        assert coerce("open_issues", {}) == {}
+        assert coerce("open_issues", {"older_than_days": None})["older_than_days"] is None
+
+    def test_a_non_numeric_value_is_a_tool_error_not_a_crash(self):
+        """§6.4's treatment of every other bad argument: tell the model what was
+        wrong so it can retry, rather than raising through the loop."""
+        with pytest.raises(ValueError, match="whole number"):
+            coerce("stale_prs", {"threshold_days": "two weeks"})
+
+    def test_a_bad_argument_surfaces_as_is_error(self):
+        """The dispatch-level contract, not just the helper's."""
+        import asyncio
+
+        outcome = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+            registry().dispatch("stale_prs", {"threshold_days": "soon"}, as_of=AS_OF)
+        )
+        assert outcome.is_error
+        assert "whole number" in outcome.rendered
+
+    def test_numbers_sent_as_strings_to_entity_tools_are_coerced(self):
+        assert coerce("pr_state", {"number": "15806"})["number"] == 15806
+
+    def test_a_boolean_is_not_silently_read_as_an_integer(self):
+        """`True` is an `int` in Python. Coercing it to 1 would turn a
+        malformed argument into a plausible-looking threshold."""
+        with pytest.raises(ValueError, match="whole number"):
+            coerce("stale_prs", {"threshold_days": True})

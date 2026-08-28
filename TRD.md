@@ -845,7 +845,16 @@ The system prompt states this constraint explicitly, and the eval's aggregate se
 
 `memory_write` and `memory_search` are **always injected** regardless of score. They are agent-infrastructure tools whose relevance is never expressed in the user's query — the user never says "please save this to memory", so semantic retrieval would never surface them, and the write-back loop would silently never fire. This exemption is disclosed in every reported tool-accuracy number: accuracy is computed over the *retrieved* set excluding the two always-on tools.
 
-**At M2 the always-injected set is empty.** Both tools are memory infrastructure and memory arrives at M3, so the M2 tool-accuracy denominator is the whole selected set with nothing excluded. The M3 baseline changes that denominator; §14.3's `milestone` field is what keeps the two from being compared as though they measured the same thing.
+**At M2 the always-injected set was empty**, because both tools are memory infrastructure and memory arrived at M3. The M2 tool-accuracy denominator is therefore the whole selected set with nothing excluded, and the M3 denominator is not — §14.3's `milestone` field is what keeps the two from being compared as though they measured the same thing.
+
+**From M3 the set is `{memory_search, memory_write}`, and it is conditional.** With `MEMORY_ENABLED=false` the registry omits both tools from `definitions()` and the selector is built from that view, so the off arm offers no memory tools rather than offering two that dispatch would refuse. `always_injected` intersects with the caller's catalog rather than asserting the pair exists, which is what makes the off arm a system without memory instead of a system with a broken tool in its prompt.
+
+Two placement details that are easy to get wrong in opposite directions:
+
+- **They are added after the top-k, not counted against it.** `k` bounds how many tools *retrieval* chose; spending one of those slots on a tool that was never a candidate would make the semantic arm look worse than it is.
+- **In `native` mode they are never deferred.** Deferring them puts them behind a BM25 search the model has no reason to run — no question is phrased so that `memory_write` is the lexical match — which would reintroduce ADR 11's exact failure through the provider's mechanism instead of ours.
+
+**Neither tool takes a `user_id`.** The orchestrator binds the user, session, and trace onto the registry before the loop starts (`for_turn`), and the schemas carry no such field. A `user_id` the model fills in is one it can get wrong or be argued into changing, and the blast radius of that is one user's memory written into another's.
 
 ### 7.3 Modes
 
@@ -872,7 +881,15 @@ Reporting rules, non-negotiable:
 
 ### 8.1 Extraction
 
-Trigger: session end, or every 10 turns for long sessions. Runs as a FastAPI `BackgroundTask` so it never blocks a response.
+Trigger: session end, or every 10 turns for long sessions.
+
+**Session end needs an endpoint, because nothing else tells the server a session is over.** `POST /sessions/{id}/end` is that signal, added to §11.1 at M4. Without it only the 10-turn trigger exists, and the three-turn check-in that PRD §7.2's entire cross-session suite is built from would extract nothing — memory would stay empty for exactly the case it exists to serve. The endpoint is idempotent: ending an already-ended session extracts nothing rather than extracting the same transcript twice.
+
+**The two triggers differ in whether they are awaited, and it is not an inconsistency.** The 10-turn trigger is detached — a manager waiting on their answer must not be billed the latency of bookkeeping that helps their *next* session. Session end is awaited, because there is no turn waiting on it and because a caller that ends one session and immediately opens the next needs those memories to exist before the next session loads its block. A detached task there would race the very thing it exists to feed.
+
+**Only user and assistant text reaches the model.** Tool calls and their results are the system's own working: the manager never saw them, and a fact extracted from a tool result is a fact about the *corpus* rather than about this user — which the facts layer already answers better and, unlike a memory, without going stale.
+
+**A failure here never surfaces on the request that produced it.** Extraction runs after the user already has their answer, so an API error, a refusal, or unparseable output costs the next session some context and nothing more.
 
 One Claude call over the transcript with `output_config.format`:
 
@@ -1034,6 +1051,7 @@ This section specified `client.beta.messages.tool_runner` until M2 built against
 | `POST` | `/chat` | `ChatRequest` | `text/event-stream` |
 | `GET` | `/sessions/{id}` | — | `Session` with messages |
 | `GET` | `/sessions` | `user_id`, `limit` | `Session[]` |
+| `POST` | `/sessions/{id}/end` | — | `{session_id, extracted, considered, discarded_low_confidence}` |
 | `GET` | `/memory` | `user_id`, `type?`, `include_superseded?` | `Memory[]` |
 | `GET` | `/memory/{id}/history` | — | `Memory[]`, oldest first |
 | `POST` | `/memory/{id}/revert` | `to_revision`, `actor` | `Memory` |
@@ -1257,7 +1275,51 @@ The gate fails if `current < baseline - tolerance` for any gated metric. Improve
 
 **`milestone` is part of the identity, alongside `config_hash`.** The M1 baseline carries only `aggregate_set_f1`, `recall_at_5`, and `mrr_at_10`; the M2 baseline adds `tool_accuracy_*` and `citation_resolution` and reinterprets set-F1 per §14.1. Two baselines with different milestones measure different systems and comparing them is meaningless — the same argument §14.2 makes for keeping `corpus_ref` and `embedding_model` inside the hash. A comparison across milestones is an error, not a regression.
 
-### 14.4 Workflows
+### 14.4 What needs a model, and what does not
+
+The ablation matrix as specced is 12 cells × 50 agent turns, and the scaling sweep is another 12. Priced against the measured M2 cost of **$0.128 per agent question**, that is **$94 + $172 = $266 per run** — and PRD §7.4 asked for it nightly, which is roughly **$8,000 a month** to re-measure a system that changes weekly at most.
+
+That number forced a question worth asking anyway: *which of these metrics actually need a model in the loop?* The answer is fewer than half, and the split is not a budget compromise — it is the same argument §14.1 already makes for keeping the direct-call runner after M2. **A measurement should run through the agent only when the agent is the thing under test.**
+
+| Measurement | Needs an agent? | Why |
+|---|:--:|---|
+| recall@5, MRR@10 | no | Properties of the retriever. Already measured directly (§14.1). |
+| Aggregate set-F1 on the direct path | no | Dispatches the same SQL the tool dispatches. |
+| Hybrid on/off (**axis A**) | no | Both arms are retriever configurations. Free. |
+| Tool-selection accuracy at any catalog size (**axis C**) | no | The selector is a pgvector query over `tool_defs` using a *local* embedding model. |
+| Prompt cost at any catalog size | no | Tool payloads serialise deterministically (§10 sorts by name), so token count is a property of the catalog. |
+| Turns to success, memory on/off (**axis B**) | **yes** | The claim is about what a *model* does with remembered context across sessions. |
+| Citation resolution, answer quality | **yes** | Properties of a generated answer. |
+
+`evals/sweep.py` implements the free half. It reproduces with no API key, no network, and no cost, which is the property §14.4's workflows already wanted from the retrieval metrics and can now have from the scaling curve too. The paid surface shrinks to two things: one golden-set baseline per milestone, and the cross-session suite.
+
+**What this gives up, stated plainly.** The matrix no longer measures *interactions* between axes — whether hybrid retrieval helps more when memory is on, say. Those cells are not free and are not run. Each axis is measured against the default configuration of the other two, which is one-factor-at-a-time, and a reader should not infer additivity from it.
+
+### 14.5 The tool-scaling curve
+
+`python evals/sweep.py` — no key required. Synthetic padding comes from `scripts/gen_synthetic_tools.py`, generated from templates rather than from a model: §7.4 asks for "plausible tool definitions from adjacent domains" and says nothing about how they are made, and a curve claiming something about 500 tools is only checkable if they are the *same* 500 next time. Sizes are prefix-stable — the 50-tool point is the first 50 of the 500 — so the curve cannot confound catalog size with catalog composition.
+
+Measured at `k=5`, `bge-small-en-v1.5`, over the 41 golden questions carrying `gold_tools`:
+
+| catalog | tool recall | crowd-out | real tools offered (of k=5) | semantic prompt | full prompt |
+|---:|---:|---:|---:|---:|---:|
+| 13 | 0.820 | 0.000 | 4.48 | 1,089 | 2,148 |
+| 50 | 0.800 | 0.096 | 4.06 | 1,089 | 8,261 |
+| 200 | 0.570 | 0.452 | 2.46 | 1,089 | 33,046 |
+| 500 | 0.530 | 0.576 | 1.94 | 1,089 | 82,615 |
+
+**PRD §5.4's cost claim holds completely and its accuracy claim does not.** The prompt stays flat at 1,089 tokens while the catalog grows 38×; full exposure grows with it to 82,615, so at 500 tools semantic selection saves **81,526 input tokens per request** — about $0.41 each. That half of the thesis is not in doubt.
+
+Tool recall over the same range falls from **0.820 to 0.530**. The mechanism is in the `crowd-out` column and is not subtle: at 500 tools, **57.6% of the top-5 is synthetic distractors**. Those rows win slots on cosine similarity and are then dropped by the selector as non-dispatchable, so the model is offered **1.94 real tools where `k` promised 5** — and the gold tool that was displaced is simply absent. Cheap prompts, half the right answers.
+
+**This is §17 Q9 arriving as a headline rather than a footnote.** That entry recorded that `bge-small-en-v1.5` puts gold tools at median cosine 0.556 and non-gold at 0.510 — a band far too narrow to separate 13 tools, let alone 500. At 13 tools a narrow band is survivable because there is almost nothing to confuse; at 500 it is fatal. The floor cannot fix it (junk's ceiling is gold's median), and `k` cannot fix it (the distractors outrank the answer). The honest reading is that **semantic tool retrieval as built solves the prompt-cost problem and does not yet solve the selection problem at scale**, and that a better-separating embedding model behind the ADR 2 swap point is the load-bearing next experiment rather than a tuning exercise.
+
+Two measurement caveats, both real:
+
+- **`native` mode has no accuracy column.** Its filtering happens server-side inside Anthropic's tool-search tool (ADR 9), so there is nothing local to score, and scoring it means one paid agent run per catalog size. Its prompt-size column is exact and is plotted; its accuracy is unmeasured and is not claimed.
+- **The crowd-out rate is an artefact of the synthetic tools being non-dispatchable**, which is what makes them clean distractors. A real 500-tool catalog would have 500 dispatchable tools, and the failure would show up as *wrong tool called* rather than *no tool offered*. The recall number is the right one either way; the mechanism would look different.
+
+### 14.6 Workflows
 
 `.github/workflows/eval-pr.yml` — on pull request:
 
@@ -1266,11 +1328,25 @@ The gate fails if `current < baseline - tolerance` for any gated metric. Improve
 3. Compare to `main.json`; fail on breach.
 4. Post a metrics table as a PR comment either way.
 
-`.github/workflows/eval-nightly.yml` — on schedule:
+`.github/workflows/eval-sweep.yml` — on pull requests that touch the selector,
+the catalog, or the embedder; and on a weekly schedule:
 
-1. Full 12-cell matrix plus the tool-scaling sweep (15 / 50 / 200 / 500).
-2. Cross-session scenario suite, memory on vs. off.
-3. Publish a markdown report and a plot artifact. Never blocks.
+1. `evals/sweep.py` over 13 / 50 / 200 / 500. **No API key, no cost.**
+2. Publish the curve and a plot artifact. Never blocks.
+
+Runs on change rather than nightly because it *is* deterministic: with a fixed
+embedding model and prefix-stable padding (§14.5) it returns the same numbers
+every night, and a job that cannot change its answer overnight has no business
+running overnight.
+
+`.github/workflows/eval-cross-session.yml` — manual dispatch, and on release:
+
+1. The cross-session suite, memory on vs. off — the only paid ablation (§14.4).
+2. Publish turns-to-success. Never blocks.
+
+Manual rather than scheduled because it is the one recurring cost that cannot
+be designed away, and because PRD §7.2's ten scenarios move only when the
+scenarios or the memory pipeline do.
 
 Only the LLM-judge and agent calls need network. Embeddings are local, so the retrieval metrics are fully deterministic — a recall@5 change is always a real change, never judge noise.
 
@@ -1310,6 +1386,7 @@ Only the LLM-judge and agent calls need network. Embeddings are local, so the re
 | 15 | Counts rendered deterministically in code | A model asked to summarise forty PRs produces a confident wrong total, and the manager cannot tell | LLM-summarised aggregates — fluent, unverifiable, and wrong often enough to poison trust in every other answer |
 | 16 | `areas.yaml` hand-authored | "The payments module" has no reliable signal in the file tree; a wrong auto-derived mapping corrupts every ownership answer invisibly | Heuristics over directory names or the import graph — plausible-looking and wrong in ways nobody notices |
 | 17 | Facts layer rebuilt, not versioned | GitHub is the system of record; a second history here would go stale differently from the first | Versioning entities like `memories` — duplicate state, no added attribution value |
+| 18 | A measurement runs through the agent only when the agent is what is under test | The scaling curve and the hybrid axis are properties of the retriever and the selector; measuring them through a paid agent turn added cost and noise without adding information, and priced the nightly matrix at ~$8k/month | Running the full 12-cell matrix and sweep through the agent (faithful to §7.3, unaffordable, and slower to reproduce); a cheaper model for eval runs (changes what is measured, and makes the numbers incomparable to the production configuration) |
 
 ---
 
@@ -1322,7 +1399,7 @@ Only the LLM-judge and agent calls need network. Embeddings are local, so the re
 5. **Consolidation clustering threshold (0.35).** Picked by inspection, not measured. Should be swept once there is real episodic volume, with the caveat that sweeping it against the golden set is not valid — needs a held-out memory-quality rubric.
 6. **`user_profile_vector` staleness.** Cached per session; a long session that writes new semantic memories will retrieve against a stale profile. Probably immaterial at demo scale, but unverified.
 7. **Cache behavior in `semantic` mode.** Per-query tool sets sit before the cache breakpoint, so within-session cache hits may fall well short of the 60% target in that mode specifically. If measurement confirms it, the fix is moving tools after the breakpoint via mid-conversation tool changes (`mid-conversation-tool-changes-2026-07-01`) — deferred until measured.
-8. **Frontend stack for the M6 transparency view.** A React SPA or server-rendered templates. The only hard constraint is §11.2: the view is driven entirely by SSE and nothing is polled, so anything that consumes `EventSource` and holds per-turn state across memories, tools, retrieval, and citations qualifies. Deferring rather than deciding — the contract arrives at M2 and has not been exercised by a real client, and picking a stack before then would be choosing without the one piece of information that matters. PRD §5.6 and the M6 milestone are deliberately stack-agnostic and need no amendment either way. Undecided.
+8. **Frontend stack for the M6 transparency view.** ~~Undecided.~~ **Resolved** — one static HTML file, no build step, served at `/`. The question was deferred at M2 pending a real client exercising §11.2, on the grounding that the choice was "a React SPA or server-rendered templates" and that "anything that consumes `EventSource`" qualifies. Both halves of that framing turned out to be wrong. **`EventSource` cannot be used at all**: it issues only GET requests, and §11.1 makes `/chat` a POST with a JSON body — so every client, in every framework, has to read the stream off `fetch` and split SSE frames on the blank line by hand. Once that is true the framework buys nothing here: the view has no routing, no forms beyond one input, and no client state outliving a turn. A build pipeline for four panes is cost without a return, and a repo that stays `uv sync` + `docker compose up` is worth more than the ergonomics. The one thing a static file genuinely gives up is component-level tests, which `tests/test_ui.py` replaces with a contract test asserting that every event in the §11.2 catalog is handled — the failure mode that matters, since an unhandled event makes a pane stop updating with no error. That test immediately caught `tool_call` being unhandled in the first draft.
 9. **`TOOL_SIMILARITY_FLOOR` does not separate anything with `bge-small`.** §7.2 justifies the floor with "a query like 'hi' returns five arbitrary tools with ~0.05 similarity"; measured against the real catalog, it does not. Over the 50 golden questions and 5 conversational non-questions, cosine similarity to a tool embedding falls in a narrow, heavily-overlapping band: gold tools median **0.556** (min 0.424), non-gold tools median **0.510** (max 0.702), junk queries median **0.452** (max 0.556). Junk's ceiling is gold's median. No absolute threshold separates them — the default 0.25 admits everything, and a floor high enough to reject "hi" would reject half the gold tools with it. The premise was a wider similarity range than `bge-small-en-v1.5` produces between any two English strings. Three ways out, none measured: a relative floor (keep tools within δ of the top score), a better-spread embedding model behind the ADR 2 swap point, or accepting that `k` alone does the work and deleting the floor. Left as specced and reported honestly in the M2 baseline rather than tuned, because tuning it against the golden set is fitting to the eval. Undecided.
 10. **Set-F1 over the union of a turn's retrievals measures tool-call count, not correctness.** ~~Undecided.~~ **Resolved** — §14.1 now scores the retrieval whose tool is in `gold_tools`, and the union is reported beside it as `aggregate_set_f1_union`, never gated. The evidence and the two rejected readings are recorded there. Decided before the M2 baseline existed, on the q006 argument rather than on which reading scored higher; the union, the reading it replaces, was the highest of the three at 0.721.
 

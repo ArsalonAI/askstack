@@ -1,0 +1,132 @@
+# Cross-session scenarios — PRD §7.2.
+#
+# Ten check-ins of three sessions each. The shape is always the same because
+# the shape is the point: the manager establishes a workstream, comes back and
+# narrows it, then returns later and asks a question whose *referents* are all
+# in the earlier sessions — "it", "them", "since we last spoke". Session three
+# is answerable in one turn only if sessions one and two were remembered.
+#
+# Hand-authored, not generated from repository history. PRD §10 left this open
+# and hand-authoring wins for one reason: what is under test is whether an
+# elliptical follow-up resolves, and ellipsis is a property of how managers
+# talk, not of what the repository contains. Generation would produce
+# well-formed questions that name their own subject, which is exactly the case
+# memory does not help with. The *anchors* are real — every area, author,
+# release, and window below exists in the corpus at the pin.
+#
+# `clarification` is what a manager says when the agent asks instead of
+# answering. It is the scripted half of "scripted scenarios": with memory on it
+# should never be needed, and every time it is sent, turns-to-success goes up
+# by one. That difference is the measurement.
+#
+# `expect` is checked mechanically against the SSE events — no judge. `tool` is
+# the tool the final turn must call; `area` and `since` are the constraints it
+# must resolve without being told them again.
+
+as_of: "2026-07-29"          # the pinned revision; every window resolves against it
+
+scenarios:
+  - id: s01
+    title: The auth workstream, then what moved
+    sessions:
+      - prompt: What merged in the auth area in June?
+      - prompt: Who did most of that work?
+      - prompt: What's changed since we last spoke?
+        clarification: I mean the auth area, since the start of June.
+        expect:
+          tool: merged_prs
+          area: auth
+
+  - id: s02
+    title: Routing ownership carried forward
+    sessions:
+      - prompt: Who's been committing to routing this year?
+      - prompt: Is any of that still unmerged?
+      - prompt: Give me the same breakdown for them again.
+        clarification: The routing area — who's been committing to it this year.
+        expect:
+          tool: commits_by_author
+          area: routing
+
+  - id: s03
+    title: A release, revisited
+    sessions:
+      - prompt: Did 0.141.0 actually ship?
+      - prompt: What went into it?
+      - prompt: And has anything shipped since that one?
+        clarification: Since release 0.141.0.
+        expect:
+          tool: merged_prs
+
+  - id: s04
+    title: Stale pull requests, tracked over time
+    sessions:
+      - prompt: What pull requests have been sitting without review for more than two weeks?
+      - prompt: Which of those touch middleware?
+      - prompt: Are those still stuck?
+        clarification: The pull requests with no review activity for more than 14 days.
+        expect:
+          tool: stale_prs
+
+  - id: s05
+    title: One contributor, followed across sessions
+    sessions:
+      - prompt: What has YuriiMotov merged recently?
+      - prompt: Which areas does that touch?
+      - prompt: Anything new from them this month?
+        clarification: From YuriiMotov, in July.
+        expect:
+          tool: merged_prs
+
+  - id: s06
+    title: The websockets question, deferred and resumed
+    sessions:
+      - prompt: Do we support websockets?
+      - prompt: Which pull request actually implemented that?
+      - prompt: Has anything changed there since?
+        clarification: In the websockets area.
+        expect:
+          tool: merged_prs
+          area: websockets
+
+  - id: s07
+    title: OpenAPI work, narrowed then re-opened
+    sessions:
+      - prompt: What's the recent activity on openapi?
+      - prompt: Was any of it a breaking change?
+      - prompt: Catch me up on it.
+        clarification: The openapi area — recent merged work.
+        expect:
+          tool: merged_prs
+          area: openapi
+
+  - id: s08
+    title: A docs push, measured twice
+    sessions:
+      - prompt: How much docs work merged in the second quarter?
+      - prompt: Who drove that?
+      - prompt: Same question, this quarter.
+        clarification: How much docs work merged — the docs area.
+        expect:
+          tool: merged_prs
+          area: docs
+
+  - id: s09
+    title: Comparing two releases, then extending
+    sessions:
+      - prompt: What's the difference between 0.140.0 and 0.141.0?
+      - prompt: Which of those were bug fixes?
+      - prompt: Now do the same against the latest one.
+        clarification: Compare against release 0.141.1.
+        expect:
+          tool: release_diff
+
+  - id: s10
+    title: A standing constraint, stated once
+    sessions:
+      - prompt: I only care about routing work — ignore docs-only changes.
+      - prompt: What merged there in July?
+      - prompt: What should I be worried about?
+        clarification: In routing — anything open and stalled.
+        expect:
+          tool: stale_prs

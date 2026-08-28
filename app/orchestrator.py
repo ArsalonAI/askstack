@@ -19,6 +19,7 @@ code than the re-send this loop already does. See §10 as amended.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
@@ -32,7 +33,9 @@ import asyncpg
 from app.config import Settings
 from app.ingest.citations import Citation, scan
 from app.interfaces import Aggregate, Entity
-from app.tools.registry import ToolOutcome, ToolRegistry
+from app.memory.lifecycle import should_extract
+from app.memory.manager import effective_confidence
+from app.tools.registry import MEMORY_TOOLS, ToolOutcome, ToolRegistry
 from app.tools.selector import to_api_tools
 from app.tracing import Tracer
 
@@ -103,6 +106,14 @@ class Turn:
         at was *actually looked up this turn*. Citing a real pull request the
         agent never opened is indistinguishable from a correct answer without
         this set."""
+        # Memory is neither substrate, and the exclusion is load-bearing twice
+        # over. `memory_search` returns `list[Memory]`, which has no `citation`
+        # — the branch below would raise on it. And if it somehow succeeded, a
+        # remembered pull request would enter this turn's result set and start
+        # resolving as one the agent had actually looked up, which is exactly
+        # the failure the result set exists to catch.
+        if outcome.name in MEMORY_TOOLS:
+            return
         result = outcome.result
         if isinstance(result, Aggregate):
             self.entity_results.update(e.citation for e in result.entities)
@@ -159,8 +170,45 @@ def _wire_block(block) -> dict[str, Any]:
     }
 
 
+# What survives into replayed history. An allowlist rather than a denylist,
+# because the two block types that break replay break it for *opposite*
+# reasons and a denylist gets one of them wrong:
+#
+#   `tool_use` is only valid immediately followed by its `tool_result`, and
+#   results are not persisted as messages — they belong to the turn that
+#   produced them, not to the conversation. Replaying one alone is a 400 on
+#   every second turn that called a tool.
+#
+#   `thinking` may not be *modified* once emitted. Dropping a `tool_use` from
+#   a message that also thought is itself a modification, so removing one
+#   without the other trades a paired-block error for a thinking-block error.
+#
+# Text is what a conversation is. The rows still hold every block verbatim
+# (§4) — this filter is on the read side, so the transcript stays a complete
+# record of what the model emitted while the replayed conversation stays valid.
+REPLAYABLE_BLOCKS = frozenset({"text"})
+
+
+def replayable(content: Any) -> Any:
+    """One stored message's content, safe to send back as history."""
+    if not isinstance(content, list):
+        return content
+    return [
+        block
+        for block in content
+        if not isinstance(block, dict) or block.get("type") in REPLAYABLE_BLOCKS
+    ]
+
+
 def _retrieval_event(outcome: ToolOutcome) -> dict[str, Any] | None:
     """§11.2 has two `retrieval` shapes — one per substrate."""
+    # Memory is neither substrate. `memory_search` returns rows about the user,
+    # not passages from the corpus, and emitting them as a retrieval would put
+    # them in this turn's result set — which is what citation resolution checks
+    # against, so a remembered pull request would start resolving as one the
+    # agent had actually looked up.
+    if outcome.name in MEMORY_TOOLS:
+        return None
     result = outcome.result
     if isinstance(result, list):
         return {
@@ -225,17 +273,57 @@ class Orchestrator:
         *,
         as_of: datetime | None = None,
         tracer=None,
+        memory=None,
+        extractor=None,
     ) -> None:
         self.pool = pool
         self.registry = registry
         self.selector = selector
         self.client = client
         self.settings = settings
+        # The ablation's off arm is `None`, not a manager that returns nothing:
+        # with memory disabled there is no block, no `memory_loaded` event, and
+        # no memory tools in the catalog.
+        self.memory = memory if settings.memory_enabled else None
+        self.extractor = extractor if settings.memory_enabled else None
+        # Strong references to detached tasks. asyncio only holds a weak one,
+        # so a task nobody keeps can be garbage-collected mid-flight — the
+        # extraction would vanish silently, which is the worst possible failure
+        # mode for background work whose whole job is to happen unobserved.
+        self._tasks: set[asyncio.Task] = set()
         self.tracer = tracer or Tracer(settings)
         # Default to the corpus pin rather than wall-clock now: the corpus
         # cannot know anything after the revision it was ingested at, so a
         # window running past it would silently under-report.
         self.as_of = as_of or datetime.now(UTC)
+
+    async def end_session(self, session_id: str):
+        """Close a session and extract from it — §8.1's other trigger.
+
+        Awaited rather than detached, unlike the mid-session trigger. There is
+        no turn waiting on this, so there is no latency to protect; and a
+        caller that ends a session and immediately starts the next one needs
+        the memories to exist before that next session loads its block. A
+        detached task would race the very thing it exists to feed.
+
+        Idempotent: ending an already-ended session extracts nothing rather
+        than extracting the same transcript twice.
+        """
+        async with self.pool.acquire() as conn:
+            closed = await conn.fetchval(
+                "UPDATE sessions SET ended_at = now()"
+                " WHERE id = $1 AND ended_at IS NULL RETURNING id",
+                session_id,
+            )
+        if closed is None or self.extractor is None:
+            return None
+        return await self.extractor.extract(session_id)
+
+    def _background(self, coro) -> None:
+        """Detach a coroutine, keeping a reference until it finishes."""
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
     # ---------------------------------------------------------------- session
 
@@ -261,11 +349,17 @@ class Orchestrator:
                 " WHERE session_id = $1 ORDER BY turn, role",
                 session_id,
             )
-        messages = [
-            {"role": r["role"], "content": json.loads(r["content"])}
-            for r in rows
-            if r["role"] in ("user", "assistant")
-        ]
+        messages = []
+        for row in rows:
+            if row["role"] not in ("user", "assistant"):
+                continue
+            content = replayable(json.loads(row["content"]))
+            # An assistant turn that only called tools leaves nothing behind
+            # once its `tool_use` blocks are dropped, and an empty content
+            # array is itself a 400. Skip the message rather than send it.
+            if isinstance(content, list) and not content:
+                continue
+            messages.append({"role": row["role"], "content": content})
         next_turn = (max((r["turn"] for r in rows), default=-1)) + 1
         return messages, next_turn
 
@@ -331,6 +425,42 @@ class Orchestrator:
         history, turn = await self._history(session_id)
         await self._persist(session_id, turn, "user", message, trace_id)
 
+        # §2.1 step 2. Bound before tool selection so the registry can dispatch
+        # `memory_write` for this user without the model naming them.
+        self.registry.for_turn(user_id, session_id, trace_id)
+        memory_block = None
+        if self.memory is not None:
+            with trace.span(
+                "memory.load", metadata={"budget": self.settings.memory_token_budget}
+            ) as span:
+                memory_block = await self.memory.load_context(
+                    user_id, session_id, message, self.settings.memory_token_budget
+                )
+                span.update(
+                    metadata={
+                        "loaded": len(memory_block.memories),
+                        "tokens": memory_block.token_count,
+                        "truncated": memory_block.truncated,
+                    }
+                )
+            yield "memory_loaded", {
+                "memories": [
+                    {
+                        "id": m.id,
+                        "type": m.mem_type,
+                        "content": m.content,
+                        "confidence": round(m.confidence, 3),
+                        "effective_confidence": round(effective_confidence(m), 3),
+                        "created_by": m.created_by,
+                        "source_session_id": m.source_session_id,
+                        "revision": m.revision,
+                    }
+                    for m in memory_block.memories
+                ],
+                "token_count": memory_block.token_count,
+                "truncated": memory_block.truncated,
+            }
+
         with trace.span(
             "tools.select",
             metadata={
@@ -358,7 +488,19 @@ class Orchestrator:
             "floor": self.settings.tool_similarity_floor,
         }
 
+        # §9: the memory block is `messages[0]`, a user-turn preamble *after*
+        # the cached prefix. In the system prompt it would invalidate the cache
+        # on every new session (ADR 8).
+        #
+        # Prepended on every turn rather than persisted into turn one. The
+        # block is not conversation — it is derived state, reloaded per request
+        # against the current query (§2.1 step 2) — and writing it into
+        # `messages` would freeze one turn's memories into the transcript and
+        # replay them for the rest of the session. Nothing is cached past the
+        # system prompt, so rebuilding it each turn costs no cache hit.
         messages = [*history, {"role": "user", "content": message}]
+        if memory_block is not None and memory_block.text:
+            messages = [{"role": "user", "content": memory_block.text}, *messages]
         # `native` mode contributes deferred flags and the provider's own
         # tool-search tool. Merged explicitly rather than splatted, so a mode
         # cannot silently overwrite the `tools` the selector just chose.
@@ -490,6 +632,14 @@ class Orchestrator:
                         }
                         if payload := _retrieval_event(outcome):
                             yield "retrieval", payload
+                        if block.name == "memory_write" and not outcome.is_error:
+                            written = outcome.result
+                            yield "memory_write", {
+                                "id": written.id,
+                                "type": written.mem_type,
+                                "content": written.content,
+                                "confidence": round(written.confidence, 3),
+                            }
                         results.append(
                             {
                                 "type": "tool_result",
@@ -518,6 +668,13 @@ class Orchestrator:
             [_wire_block(b) for b in assistant_blocks],
             trace_id,
         )
+
+        # §8.1's mid-session trigger, fired after the turn is persisted so the
+        # extractor reads a complete transcript. Detached rather than awaited:
+        # the manager already has their answer, and the bookkeeping that helps
+        # their *next* session must not be billed to this one's latency.
+        if self.extractor is not None and should_extract(turn):
+            self._background(self.extractor.extract(session_id))
 
         done = {
             "turn": turn,

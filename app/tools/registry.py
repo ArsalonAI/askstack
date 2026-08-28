@@ -198,9 +198,68 @@ CATALOG: tuple[ToolDef, ...] = (
         "lives. Returns ranked excerpts, not a complete set.",
         _search_schema("issue and pull request discussions"),
     ),
+    # §7.2.2 / ADR 11. These two are always injected, never retrieved — see
+    # ALWAYS_INJECTED below.
+    _tool(
+        "memory_write",
+        "Save a durable fact about this user or their work for future "
+        "sessions. Call this when the user states a standing preference, names "
+        "a workstream or person they track, or when you learn something that "
+        "would save them repeating themselves next time. Do NOT save status "
+        "claims as standing truth — those go stale and must be re-verified.",
+        _obj(
+            {
+                "statement": {
+                    **_STR,
+                    "description": (
+                        "The fact, written to be read without this conversation "
+                        "around it. 'They only care about auth PRs', not 'they "
+                        "said that doesn't matter'."
+                    ),
+                },
+                "entities": {
+                    "type": "array",
+                    "items": _STR,
+                    "description": "Citations this fact is about, e.g. ['pr:15806'].",
+                },
+                "confidence": {
+                    "type": "number",
+                    "description": "0..1. How sure you are this is durably true.",
+                },
+            },
+            ["statement"],
+        ),
+    ),
+    _tool(
+        "memory_search",
+        "Look up what you already know about this user beyond the memories "
+        "already in context. Call this when the user refers to an earlier "
+        "conversation ('like we discussed', 'the thing from last week') and the "
+        "loaded memories do not cover it.",
+        _obj(
+            {
+                "query": {**_STR, "description": "What to look for in memory."},
+                "type": {
+                    "type": "string",
+                    "enum": ["semantic", "episodic", "procedural"],
+                    "description": "Restrict to one memory type. Omit to search all.",
+                },
+            },
+            ["query"],
+        ),
+    ),
 )
 
 SEARCH_SOURCES = {"search_docs": "docs", "search_code": "code", "search_issues": "issue"}
+
+# §7.2.2 / ADR 11. Their relevance is never expressed in the user's query — the
+# user never says "please save this to memory" — so semantic retrieval would
+# never surface them and the write-back loop would silently never fire. Every
+# reported tool-accuracy number excludes these, because a tool that is always
+# present measures nothing about the selector.
+ALWAYS_INJECTED = ("memory_search", "memory_write")
+
+MEMORY_TOOLS = frozenset(ALWAYS_INJECTED)
 BY_NAME = {tool.name: tool for tool in CATALOG}
 
 
@@ -249,6 +308,77 @@ def _render_entity(kind: str, ref: str, entity: Entity | None) -> str:
     return "\n".join(lines)
 
 
+def coerce(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Bring tool inputs to the types their schema declares.
+
+    A tool schema is a *request*, not a guarantee. Without `strict: true` the
+    API does not validate `tool_use.input` against it, and a model that reads
+    "over the last 30 days" will sometimes send `"30"` where the schema says
+    integer. asyncpg then rejects it at the driver — `'str' object cannot be
+    interpreted as an integer` — which surfaced as `upstream_unavailable` and
+    took down a whole scenario, because a type error inside a tool is
+    indistinguishable from the API being down at the point it is caught.
+
+    Coercing here rather than at each call site is the point: dispatch is the
+    boundary between text a model produced and code that assumes types, and a
+    boundary that trusts its input is not a boundary. This also keeps the fix
+    provider-independent — `strict: true` would close it for Anthropic, but the
+    registry should not be relying on any provider's validation to stay
+    type-safe.
+
+    A value that cannot be coerced is a tool error, not a crash: the model gets
+    told what was wrong and can retry, which is the §6.4 treatment of every
+    other bad argument.
+    """
+    schema = BY_NAME[name].input_schema.get("properties", {})
+    out = dict(arguments)
+    for key, spec in schema.items():
+        if key not in out or out[key] is None:
+            continue
+        declared = spec.get("type")
+        value = out[key]
+        if declared == "integer":
+            # `bool` is an `int` subclass, so an unguarded isinstance check
+            # would wave `True` through as the integer 1 — a malformed argument
+            # arriving as a plausible-looking threshold. Rejected explicitly.
+            if isinstance(value, bool):
+                raise ValueError(
+                    f"{name}: {key} must be a whole number, got {value!r}"
+                )
+            if isinstance(value, int):
+                continue
+            try:
+                out[key] = int(str(value).strip())
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"{name}: {key} must be a whole number, got {value!r}"
+                ) from None
+        elif declared == "string" and not isinstance(value, str):
+            out[key] = str(value)
+    return out
+
+
+def _render_memory_write(memory) -> str:
+    """Confirms the write and shows its id, so the model can supersede it later
+    in the same session rather than writing a near-duplicate."""
+    return (
+        f"**Saved to {memory.mem_type} memory** (`{memory.id}`, "
+        f"confidence {memory.confidence:.1f}).\n\n> {memory.content}"
+    )
+
+
+def _render_memory_search(memories) -> str:
+    """A miss is a fact here too — "nothing remembered about X" is a real
+    answer, and reads differently from a tool that failed."""
+    if not memories:
+        return "**Nothing in memory matches that.**"
+    from app.memory.manager import render_memory
+
+    lines = ["**From memory:**", ""]
+    lines.extend(f"- {render_memory(m)}" for m in memories)
+    return "\n".join(lines)
+
+
 def _render_chunks(chunks: list[Chunk]) -> str:
     if not chunks:
         return "**No matching passages.**"
@@ -265,16 +395,39 @@ class ToolRegistry:
     """Definitions plus dispatch. Owns rendering; owns no selection policy."""
 
     def __init__(
-        self, facts: FactsStore, retriever: Retriever, *, top_k: int = 10
+        self,
+        facts: FactsStore,
+        retriever: Retriever,
+        *,
+        top_k: int = 10,
+        memory=None,
     ) -> None:
         self.facts = facts
         self.retriever = retriever
         self.top_k = top_k
+        # None when MEMORY_ENABLED is false — the ablation's "off" arm. The
+        # memory tools are then not offered at all rather than offered and
+        # failing, so the off arm measures a system without memory rather than
+        # one with a broken tool in the prompt.
+        self.memory = memory
+        self._turn: tuple[str, str, str | None] | None = None
+
+    def for_turn(self, user_id: str, session_id: str, trace_id: str | None) -> None:
+        """Bind whose memory this turn may read and write.
+
+        Deliberately not tool arguments. A `user_id` the model fills in is a
+        `user_id` the model can get wrong or be talked into changing, and the
+        blast radius of that is one user's memory written into another's.
+        """
+        self._turn = (user_id, session_id, trace_id)
 
     def definitions(self) -> list[ToolDef]:
         """Sorted by name — §10. An unsorted list reorders between runs, which
         changes the prompt prefix bytes and destroys the cache silently."""
-        return sorted(CATALOG, key=lambda t: t.name)
+        catalog = CATALOG
+        if self.memory is None:
+            catalog = tuple(t for t in catalog if t.name not in MEMORY_TOOLS)
+        return sorted(catalog, key=lambda t: t.name)
 
     async def _window(self, expression: str, as_of: datetime) -> tuple[datetime, datetime]:
         """Resolve a window, including the release-anchored form the pure
@@ -312,6 +465,11 @@ class ToolRegistry:
             return done(f"No tool named {name!r}.", is_error=True)
 
         try:
+            arguments = coerce(name, arguments)
+        except ValueError as exc:
+            return done(str(exc), is_error=True)
+
+        try:
             return done(*await self._call(name, arguments, as_of, trace))
         except UnresolvableWindow as exc:
             # §6.4: an unresolvable expression is a tool error, never a guess.
@@ -325,6 +483,9 @@ class ToolRegistry:
             return done(f"{name} failed: {exc}", is_error=True)
 
     async def _call(self, name: str, args: dict[str, Any], as_of: datetime, trace=None):
+        if name in MEMORY_TOOLS:
+            return await self._memory(name, args)
+
         if name == "merged_prs":
             since, until = await self._window(args["window"], as_of)
             aggregate = await self.facts.merged_prs(since, until, args.get("area"))
@@ -367,3 +528,35 @@ class ToolRegistry:
             args["query"], self.top_k, sources=[source], trace=trace
         )
         return _render_chunks(chunks), chunks
+
+    async def _memory(self, name: str, args: dict[str, Any]):
+        """The two agent-facing memory tools.
+
+        Dispatch needs `session_id`, `user_id`, and `trace_id`, which are
+        properties of the request rather than of the tool call — the
+        orchestrator binds them with `for_turn` before the loop starts, so the
+        model never has to pass (or be able to forge) whose memory it writes.
+        """
+        if self.memory is None:
+            raise ValueError(
+                f"{name} is unavailable: memory is disabled for this run"
+            )
+        if self._turn is None:
+            raise ValueError(f"{name} called outside a bound turn")
+
+        user_id, session_id, trace_id = self._turn
+        if name == "memory_write":
+            memory = await self.memory.record(
+                session_id,
+                args["statement"],
+                user_id=user_id,
+                entities=args.get("entities", ()),
+                confidence=float(args.get("confidence", 0.8)),
+                trace_id=trace_id,
+            )
+            return _render_memory_write(memory), memory
+
+        found = await self.memory.search(
+            user_id, args["query"], mem_type=args.get("type"), k=5
+        )
+        return _render_memory_search(found), found

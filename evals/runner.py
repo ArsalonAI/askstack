@@ -46,6 +46,7 @@ from app.facts.store import PostgresFactsStore  # noqa: E402
 from app.interfaces import Chunk  # noqa: E402
 from app.retrieval.embedder import get_embedder  # noqa: E402
 from app.retrieval.hybrid import HybridRetriever  # noqa: E402
+from app.tools.registry import ALWAYS_INJECTED  # noqa: E402
 from evals.build_gold import (  # noqa: E402
     EXACT_CLASSES,
     GENERATED,
@@ -72,9 +73,11 @@ TOLERANCES = {
 }
 
 # Bumped whenever a scoring rule changes, which invalidates every cached row
-# written under the old one. `2` is §14.1's gold-tool-matched set-F1 replacing
-# the union — see §17 Q10.
-CACHE_FORMAT = 2
+# written under the old one.
+#   2 — §14.1's gold-tool-matched set-F1 replacing the union (§17 Q10)
+#   3 — §7.2.2's always-injected exclusion from tool accuracy, which arrives
+#       with memory at M3 and changes the denominator
+CACHE_FORMAT = 3
 
 RECALL_K = 5
 MRR_K = 10
@@ -167,6 +170,31 @@ def jaccard(got: set[str], want: set[str]) -> float:
     return len(got & want) / len(union) if union else 0.0
 
 
+def build_memory(pool, embedder, client, cfg=None):
+    """The Manager the agent path runs with, or `None` for the off arm.
+
+    Takes its `Settings` explicitly rather than reading the module global. The
+    scenario suite runs both arms in one process by copying `settings` with
+    `memory_enabled` flipped, and a builder that consulted the global would
+    hand the off arm a live manager — an ablation whose off arm is on measures
+    nothing and looks like a null result.
+
+    `None` rather than a manager that returns an empty block: with memory off
+    the registry drops both memory tools and the selector never sees them, so
+    the arm is a system without memory rather than one carrying two tools it
+    cannot use.
+    """
+    cfg = cfg or settings
+    if not cfg.memory_enabled:
+        return None
+    from app.memory.manager import MemoryManager
+    from app.memory.store import PostgresMemoryStore
+
+    return MemoryManager(
+        PostgresMemoryStore(pool), embedder, client, model=cfg.agent_model
+    )
+
+
 def gold_tool_entities(
     retrievals: list[dict], gold_tools: set[str]
 ) -> list[str]:
@@ -223,8 +251,14 @@ async def score_agent(orchestrator, question: dict, gold_entities: list[str]) ->
     error: dict | None = None
     usage: dict = {}
 
+    # One user per question, not a shared "eval" user. The golden set is 50
+    # independent questions; with memory on, a shared user would let question 1
+    # write a memory that question 5 reads, and a question scored against
+    # context from an unrelated question is not the question the set froze.
+    # This is the same argument the per-question session already makes, one
+    # level up — and it only becomes load-bearing now that memory exists.
     async for event, data in orchestrator.run(
-        "eval", None, question["question"], as_of=as_of
+        f"eval_{question['id']}", None, question["question"], as_of=as_of
     ):
         if event == "tools_selected":
             selected = [t["name"] for t in data["selected"]]
@@ -252,9 +286,15 @@ async def score_agent(orchestrator, question: dict, gold_entities: list[str]) ->
             usage = data
 
     gold_tools = set(question.get("gold_tools") or [])
+    # §7.2.2: tool accuracy is computed over the *retrieved* set, excluding the
+    # always-injected tools. They are present regardless of the query, so
+    # counting them measures nothing about the selector — and because they
+    # appear at M3 and not at M2, leaving them in would show up as a tool-
+    # accuracy drop caused entirely by memory shipping.
+    scored_tools = {t for t in selected if t not in ALWAYS_INJECTED}
     metrics: dict[str, float] = {
-        "tool_jaccard": jaccard(set(selected), gold_tools),
-        "tool_exact": float(set(selected) == gold_tools),
+        "tool_jaccard": jaccard(scored_tools, gold_tools),
+        "tool_exact": float(scored_tools == gold_tools),
     }
     if citations:
         # §11.2: both halves. A citation that resolves to a real entity the
@@ -287,6 +327,7 @@ async def score_agent(orchestrator, question: dict, gold_entities: list[str]) ->
         gold=list(gold),
         agent={
             "selected": selected,
+            "scored_tools": sorted(scored_tools),
             "called": tool_calls,
             "gold_tools": sorted(gold_tools),
             "retrievals": retrievals,
@@ -359,7 +400,7 @@ async def run_agent_path(
     from anthropic import AsyncAnthropic
 
     from app.orchestrator import Orchestrator
-    from app.tools.registry import CATALOG, ToolRegistry
+    from app.tools.registry import ToolRegistry
     from app.tools.selector import build_selector
 
     client = AsyncAnthropic(api_key=settings.anthropic_api_key)
@@ -382,20 +423,29 @@ async def run_agent_path(
         # two retriever arms concurrently, the selector, the citation checks —
         # and with concurrency == pool size none can ever be granted.
         async with semaphore:
+            registry = ToolRegistry(
+                PostgresFactsStore(pool),
+                retriever,
+                top_k=settings.retrieval_top_k,
+                memory=build_memory(pool, retriever.embedder, client),
+            )
             orchestrator = Orchestrator(
                 pool,
-                ToolRegistry(
-                    PostgresFactsStore(pool), retriever, top_k=settings.retrieval_top_k
-                ),
+                registry,
                 build_selector(
                     settings.tool_retrieval_mode,
-                    CATALOG,
+                    # The registry's view, not CATALOG: with memory off it
+                    # omits both memory tools, and offering a tool dispatch
+                    # would refuse is not a selection the arm should be
+                    # credited or charged for.
+                    registry.definitions(),
                     pool=pool,
                     embedder=retriever.embedder,
                     floor=settings.tool_similarity_floor,
                 ),
                 client,
                 settings,
+                memory=registry.memory,
             )
             result = await score_agent(
                 orchestrator, question, generated.get(question["id"], [])
