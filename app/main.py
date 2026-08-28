@@ -11,11 +11,12 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 
 import asyncpg
 from anthropic import AsyncAnthropic
 from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.config import settings
@@ -130,6 +131,32 @@ def _orchestrator(as_of: datetime | None = None) -> Orchestrator:
         memory=memory,
         extractor=extractor,
     )
+
+
+UI = Path(__file__).resolve().parents[1] / "ui" / "index.html"
+
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_ui() -> str:
+    """PRD §5.6's transparency view — TRD §17 Q8, resolved.
+
+    One static file, no build step. That question was left open at M2 for lack
+    of information: "a React SPA or server-rendered templates", pending a real
+    client exercising the §11.2 contract. Two now have, and what they showed is
+    that the choice was never between those two.
+
+    `EventSource` — which §17 Q8 named as the constraint — **cannot be used at
+    all**, because it only issues GET requests and §11.1 makes `/chat` a POST
+    with a JSON body. Every client has to read the stream off `fetch` and split
+    SSE frames by hand regardless of framework, so a framework buys nothing
+    here: the view has no routing, no forms beyond one input, and no client
+    state that outlives a turn.
+
+    Read from disk per request rather than cached at import. The file is a few
+    kilobytes, this is a single-process app, and editing the view without
+    restarting the server is worth more than the read.
+    """
+    return UI.read_text()
 
 
 @app.get("/healthz")

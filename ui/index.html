@@ -1,0 +1,391 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>askstack</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  /* One file, no build step. See the note in app/main.py serve_ui() and
+     TRD §17 Q8 — the view is a read of one event stream, and a toolchain for
+     four panes with no client-side routing is cost without a return. */
+  :root {
+    --bg: #0f1115; --panel: #161920; --line: #262b36; --ink: #e6e9ef;
+    --dim: #8b93a7; --accent: #7aa2f7; --ok: #7ec699; --warn: #e0af68;
+    --bad: #f7768e; --mono: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.55
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+    height: 100vh; display: flex; flex-direction: column;
+  }
+  header {
+    padding: 10px 16px; border-bottom: 1px solid var(--line);
+    display: flex; gap: 14px; align-items: baseline; flex-wrap: wrap;
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .2px; }
+  header .meta { color: var(--dim); font-size: 12px; font-family: var(--mono); }
+  main { flex: 1; display: grid; grid-template-columns: 300px 1fr 340px; min-height: 0; }
+  section { overflow-y: auto; padding: 12px 14px; min-width: 0; }
+  section + section { border-left: 1px solid var(--line); }
+  h2 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .09em;
+    color: var(--dim); margin: 0 0 10px; font-weight: 600;
+  }
+  h2 .count { color: var(--accent); font-family: var(--mono); }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+    padding: 8px 10px; margin-bottom: 7px; font-size: 13px;
+  }
+  .prov {
+    font-family: var(--mono); font-size: 10.5px; color: var(--dim);
+    margin-bottom: 4px; display: flex; gap: 8px; flex-wrap: wrap;
+  }
+  .pill {
+    font-family: var(--mono); font-size: 10.5px; padding: 1px 6px;
+    border-radius: 999px; border: 1px solid var(--line); color: var(--dim);
+  }
+  .pill.on { color: var(--accent); border-color: var(--accent); }
+  .pill.syn { color: var(--warn); border-color: var(--warn); }
+  .turn { margin-bottom: 18px; }
+  .who { font-size: 11px; color: var(--dim); margin-bottom: 5px; font-family: var(--mono); }
+  .answer { white-space: pre-wrap; word-wrap: break-word; }
+  .answer code { font-family: var(--mono); font-size: 12.5px; }
+  .cite {
+    font-family: var(--mono); font-size: 12px; padding: 0 3px;
+    border-radius: 3px; border-bottom: 1px solid;
+  }
+  .cite.ok { color: var(--ok); border-color: var(--ok); }
+  .cite.bad { color: var(--bad); border-color: var(--bad); }
+  .empty { color: var(--dim); font-size: 12.5px; font-style: italic; }
+  footer { border-top: 1px solid var(--line); padding: 10px 14px; }
+  form { display: flex; gap: 8px; }
+  input[type=text] {
+    flex: 1; background: var(--panel); border: 1px solid var(--line);
+    color: var(--ink); border-radius: 6px; padding: 9px 11px; font: inherit;
+  }
+  input[type=text]:focus { outline: none; border-color: var(--accent); }
+  button {
+    background: var(--accent); border: 0; color: #0b0d12; font-weight: 600;
+    border-radius: 6px; padding: 9px 16px; cursor: pointer; font: inherit;
+  }
+  button:disabled { opacity: .45; cursor: default; }
+  .tool { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+  .tool .score { font-family: var(--mono); font-size: 10.5px; color: var(--dim); }
+  .chunk { font-family: var(--mono); font-size: 11px; color: var(--dim); }
+  .chunk.cited { color: var(--ok); }
+  .err { color: var(--bad); font-size: 12.5px; }
+  @media (max-width: 1000px) {
+    main { grid-template-columns: 1fr; }
+    section + section { border-left: 0; border-top: 1px solid var(--line); }
+  }
+</style>
+
+<header>
+  <h1>askstack</h1>
+  <span class="meta" id="status">connecting…</span>
+</header>
+
+<main>
+  <section id="pane-memory">
+    <h2>Memory loaded <span class="count" id="mem-count"></span></h2>
+    <div id="memories"><p class="empty">Nothing loaded yet.</p></div>
+  </section>
+
+  <section id="pane-chat">
+    <h2>Conversation</h2>
+    <div id="turns"></div>
+  </section>
+
+  <section id="pane-evidence">
+    <h2>Tools selected <span class="count" id="tool-count"></span></h2>
+    <div id="tools"><p class="empty">—</p></div>
+    <h2 style="margin-top:18px">Tools called <span class="count" id="call-count"></span></h2>
+    <div id="calls"><p class="empty">—</p></div>
+    <h2 style="margin-top:18px">Sources consulted <span class="count" id="src-count"></span></h2>
+    <div id="sources"><p class="empty">—</p></div>
+  </section>
+</main>
+
+<footer>
+  <form id="ask">
+    <input type="text" id="q" placeholder="Did pull request 15806 ship?" autocomplete="off" />
+    <button id="send">Ask</button>
+  </form>
+</footer>
+
+<script>
+  // PRD §5.6: "the interface surfaces the machinery, not just the answer" — and
+  // §11.2 makes the SSE events the contract that view is built on. Every pane
+  // below is a projection of one event type. Nothing is polled and nothing is
+  // computed here that the server did not already send: the citation colours
+  // come from `citation.resolved && citation.in_result_set`, which the server
+  // decides, not from anything this file re-derives.
+  const $ = (id) => document.getElementById(id);
+  const el = (tag, cls, text) => {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined) n.textContent = text;
+    return n;
+  };
+
+  let sessionId = null;
+  const citations = new Map(); // citation -> resolved?
+
+  fetch("/healthz")
+    .then((r) => r.json())
+    .then((h) => {
+      $("status").textContent =
+        `${h.db.chunks ?? "?"} chunks · pinned ${String(h.corpus_as_of).slice(0, 10)}` +
+        ` · ${h.model} · tools=${h.tool_mode}` +
+        (h.anthropic_key ? "" : " · NO API KEY");
+    })
+    .catch(() => ($("status").textContent = "service unreachable"));
+
+  function renderMemories(memories) {
+    const box = $("memories");
+    box.innerHTML = "";
+    $("mem-count").textContent = memories.length || "";
+    if (!memories.length) {
+      box.append(el("p", "empty", "No memories matched this query."));
+      return;
+    }
+    for (const m of memories) {
+      const card = el("div", "card");
+      const prov = el("div", "prov");
+      // §8.5 renders provenance so a low-confidence or stale memory can be
+      // discounted rather than read as ground truth. The same reasoning
+      // applies to a human reading this pane.
+      prov.append(el("span", null, m.type));
+      prov.append(el("span", null, `conf ${m.effective_confidence.toFixed(2)}`));
+      prov.append(el("span", null, m.created_by));
+      if (m.revision > 1) prov.append(el("span", null, `rev ${m.revision}`));
+      card.append(prov, el("div", null, m.content));
+      box.append(card);
+    }
+  }
+
+  function renderTools(payload) {
+    const box = $("tools");
+    box.innerHTML = "";
+    $("tool-count").textContent = `${payload.selected.length}/${payload.catalog_size}`;
+    for (const t of payload.selected) {
+      const card = el("div", "card");
+      const row = el("div", "tool");
+      const name = el("span", null, t.name);
+      if (t.is_synthetic) name.append(" ", el("span", "pill syn", "synthetic"));
+      row.append(name, el("span", "score", t.score ? t.score.toFixed(3) : "—"));
+      card.append(row);
+      box.append(card);
+    }
+    if (!payload.selected.length) box.append(el("p", "empty", "None above the floor."));
+  }
+
+  function addCall(payload) {
+    const box = $("calls");
+    if (box.querySelector(".empty")) box.innerHTML = "";
+    const card = el("div", "card");
+    const row = el("div", "tool");
+    const name = el("span", null, payload.name);
+    if (payload.status === "error") name.append(" ", el("span", "pill", "error"));
+    row.append(name, el("span", "score", `${payload.duration_ms ?? 0}ms`));
+    card.append(row);
+    const args = Object.entries(payload.input || {})
+      .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
+      .join("  ");
+    if (args) card.append(el("div", "chunk", args));
+    if (payload.status === "error") card.querySelector(".pill").className = "pill";
+    box.append(card);
+    $("call-count").textContent = box.querySelectorAll(".card").length;
+  }
+
+  function addSource(payload) {
+    const box = $("sources");
+    if (box.querySelector(".empty")) box.innerHTML = "";
+    const card = el("div", "card");
+    const head = el("div", "prov");
+    head.append(el("span", null, payload.tool));
+    if (payload.kind === "structured") {
+      head.append(el("span", null, `${payload.count} entities`));
+      if (payload.area) head.append(el("span", "pill on", payload.area));
+    } else {
+      head.append(el("span", null, `${payload.chunks.length} chunks`));
+    }
+    card.append(head);
+    const items = payload.kind === "structured" ? payload.entities : payload.chunks;
+    for (const item of items.slice(0, 12)) {
+      const line = el("div", "chunk", item.citation);
+      line.dataset.citation = item.citation;
+      card.append(line);
+    }
+    if (items.length > 12) card.append(el("div", "chunk", `…${items.length - 12} more`));
+    box.append(card);
+    $("src-count").textContent = box.querySelectorAll(".chunk[data-citation]").length;
+  }
+
+  function markCited(citation, ok) {
+    citations.set(citation, ok);
+    for (const node of document.querySelectorAll(
+      `.chunk[data-citation="${CSS.escape(citation)}"]`
+    )) {
+      node.classList.add("cited");
+    }
+    // Re-paint any citation already streamed into the answer. Token deltas
+    // arrive before the `citation` event that judges them, so the answer is
+    // painted twice: once optimistically, once when the verdict lands.
+    for (const node of document.querySelectorAll(
+      `.cite[data-citation="${CSS.escape(citation)}"]`
+    )) {
+      node.className = `cite ${ok ? "ok" : "bad"}`;
+      node.title = ok
+        ? "resolves, and was retrieved this turn"
+        : "does not resolve, or was not retrieved this turn";
+    }
+  }
+
+  // The trailing character is constrained separately so that a sentence-final
+  // period is left outside the citation ("shipped in pr:15806.") while the
+  // periods *inside* release:0.141.0 and docs/....md are kept. A single
+  // character class cannot express both.
+  const CITE = /\b(?:pr|issue|commit|release|docs|code):[^\s,;)\]]*[^\s,;:.)\]]/g;
+
+  function paintAnswer(node, text) {
+    node.innerHTML = "";
+    let last = 0;
+    for (const match of text.matchAll(CITE)) {
+      node.append(text.slice(last, match.index));
+      const verdict = citations.get(match[0]);
+      const span = el(
+        "span",
+        `cite ${verdict === undefined ? "" : verdict ? "ok" : "bad"}`,
+        match[0]
+      );
+      span.dataset.citation = match[0];
+      node.append(span);
+      last = match.index + match[0].length;
+    }
+    node.append(text.slice(last));
+  }
+
+  async function ask(question) {
+    $("send").disabled = true;
+    citations.clear();
+    $("sources").innerHTML = '<p class="empty">—</p>';
+    $("calls").innerHTML = '<p class="empty">—</p>';
+    $("src-count").textContent = "";
+    $("call-count").textContent = "";
+
+    const turns = $("turns");
+    turns.append(
+      Object.assign(el("div", "turn"), {
+        innerHTML: "",
+      })
+    );
+    const turn = turns.lastElementChild;
+    turn.append(el("div", "who", "you"));
+    turn.append(el("div", null, question));
+
+    const reply = el("div", "turn");
+    reply.append(el("div", "who", "askstack"));
+    const answer = el("div", "answer");
+    reply.append(answer);
+    turns.append(reply);
+
+    let text = "";
+    // `EventSource` cannot be used here: it only issues GET requests, and
+    // §11.1 makes /chat a POST with a JSON body. This is the detail that
+    // settles TRD §17 Q8 — the choice was never "React or templates", it was
+    // that any client has to read the stream off `fetch` by hand either way.
+    const response = await fetch("/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ user_id: "you", session_id: sessionId, message: question }),
+    });
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      // SSE frames are separated by a blank line. Splitting on newline alone
+      // would tear a frame in half whenever a chunk boundary lands mid-event.
+      const frames = buffer.split("\n\n");
+      buffer = frames.pop();
+      for (const frame of frames) {
+        const name = frame.match(/^event: (.+)$/m)?.[1];
+        const raw = frame.match(/^data: (.*)$/m)?.[1];
+        if (!name || raw === undefined) continue;
+        let data;
+        try {
+          data = JSON.parse(raw);
+        } catch {
+          continue;
+        }
+        handle(name, data, answer, () => (text = text));
+        if (name === "token") {
+          text += data.text;
+          paintAnswer(answer, text);
+        }
+      }
+    }
+    $("send").disabled = false;
+    $("q").focus();
+  }
+
+  function handle(name, data, answer) {
+    switch (name) {
+      case "session":
+        sessionId = data.session_id;
+        break;
+      case "memory_loaded":
+        renderMemories(data.memories);
+        break;
+      case "tools_selected":
+        renderTools(data);
+        break;
+      case "tool_call":
+        // Only terminal statuses. A `started` event is followed by an `ok` or
+        // `error` for the same call, and rendering both would double every row.
+        if (data.status !== "started") addCall(data);
+        break;
+      case "retrieval":
+        addSource(data);
+        break;
+      case "citation":
+        markCited(data.citation, data.resolved && data.in_result_set);
+        break;
+      case "memory_write": {
+        const box = $("memories");
+        if (box.querySelector(".empty")) box.innerHTML = "";
+        const card = el("div", "card");
+        const prov = el("div", "prov");
+        prov.append(el("span", "pill on", "written this turn"));
+        prov.append(el("span", null, data.type));
+        card.append(prov, el("div", null, data.content));
+        box.append(card);
+        break;
+      }
+      case "error":
+        answer.append(el("div", "err", `${data.code}: ${data.message}`));
+        break;
+      case "done":
+        $("status").textContent =
+          `turn ${data.turn} · $${data.cost_usd.toFixed(4)} · ${data.latency_ms}ms` +
+          ` · ${data.usage.input_tokens ?? 0} in / ${data.usage.output_tokens ?? 0} out`;
+        break;
+    }
+  }
+
+  $("ask").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const question = $("q").value.trim();
+    if (!question) return;
+    $("q").value = "";
+    ask(question).catch((err) => {
+      $("status").textContent = `failed: ${err.message}`;
+      $("send").disabled = false;
+    });
+  });
+
+  $("q").focus();
+</script>
