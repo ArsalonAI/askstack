@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 
 from app.config import settings
 from app.facts.store import PostgresFactsStore
+from app.memory.consolidation import Consolidator
 from app.memory.lifecycle import Extractor
 from app.memory.manager import MemoryManager, effective_confidence
 from app.memory.store import (
@@ -284,6 +285,32 @@ async def revert_memory(memory_id: str, request: RevertRequest) -> dict:
             }
         }
     return _memory_json(reverted)
+
+
+@app.post("/admin/consolidate")
+async def admin_consolidate(user_id: str) -> dict:
+    """§11.1, §8.2. Episodic → semantic for one user.
+
+    Awaited rather than backgrounded, unlike extraction. Nobody is waiting on a
+    streamed answer here, and a caller who asked for consolidation wants the
+    `ConsolidationReport` — clusters formed, memories written, memories
+    superseded — not an acknowledgement that something will happen later.
+    """
+    if not settings.memory_enabled:
+        return {"error": {"code": "memory_disabled", "message": "MEMORY_ENABLED=false"}}
+    report = await Consolidator(
+        PostgresMemoryStore(app.state.pool),
+        app.state.embedder,
+        app.state.client,
+        settings,
+    ).consolidate(user_id)
+    return {
+        "user_id": user_id,
+        "clusters_formed": report.clusters_formed,
+        "memories_written": report.memories_written,
+        "memories_superseded": report.memories_superseded,
+        "facts_skipped": report.facts_skipped,
+    }
 
 
 @app.get("/sessions/{session_id}")

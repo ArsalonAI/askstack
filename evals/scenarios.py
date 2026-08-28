@@ -104,6 +104,77 @@ class ScenarioResult:
         return None
 
 
+# Bumped when a scoring rule changes, exactly as in `evals/runner.py`.
+CACHE_FORMAT = 1
+
+
+def cache_key(scenario_id: str, arm: str) -> str:
+    return f"{scenario_id}/{arm}"
+
+
+def load_cache(path: Path | None) -> dict[str, ScenarioResult]:
+    """Completed scenarios from an earlier run.
+
+    `evals/runner.py` has cached per question since M2 for a reason this
+    harness then rediscovered the hard way: a run killed partway through
+    throws away everything it already paid for. Three sessions per scenario
+    with extraction between them takes long enough that something *will*
+    interrupt it — a timeout, a laptop lid, a killed background task — and
+    losing eight completed scenarios to re-measure the remaining twelve is the
+    kind of waste that stops people running the eval at all.
+
+    An errored scenario is never cached, for the same reason the report refuses
+    to be written from one: it is not a measurement, and freezing it would turn
+    a billing failure into a permanent zero.
+    """
+    if path is None or not path.is_file():
+        return {}
+    cached, stale = {}, 0
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if row.get("cache_format") != CACHE_FORMAT:
+            stale += 1
+            continue
+        result = ScenarioResult(
+            scenario_id=row["scenario_id"],
+            arm=row["arm"],
+            succeeded=row["succeeded"],
+            turns_to_success=row["turns_to_success"],
+        )
+        session = SessionResult(index=0, session_id=None)
+        session.turns = [TurnResult(prompt="", cost_usd=row["cost_usd"])]
+        session.extracted = row.get("extracted", 0)
+        result.sessions = [session]
+        cached[cache_key(result.scenario_id, result.arm)] = result
+    if stale:
+        print(f"  discarding {stale} cached scenario(s) from an older scorer",
+              file=sys.stderr)
+    return cached
+
+
+def append_cache(path: Path | None, result: ScenarioResult) -> None:
+    if path is None or result.error:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "cache_format": CACHE_FORMAT,
+                    "scenario_id": result.scenario_id,
+                    "arm": result.arm,
+                    "succeeded": result.succeeded,
+                    "turns_to_success": result.turns_to_success,
+                    "cost_usd": round(result.cost_usd, 6),
+                    "extracted": sum(s.extracted for s in result.sessions),
+                }
+            )
+            + "\n"
+        )
+
+
 def load_suite(path: Path = SUITE) -> dict:
     raw = yaml.safe_load(path.read_text()) or {}
     scenarios = raw.get("scenarios") or []
@@ -462,6 +533,13 @@ async def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--arm", choices=["on", "off"], help="run one arm")
     parser.add_argument("--scenario", help="run one scenario id")
     parser.add_argument("--json", type=Path, help="write the report here")
+    parser.add_argument(
+        "--cache", type=Path, default=Path(".cache/scenario_results.jsonl"),
+        help="reuse completed scenarios so a killed run resumes",
+    )
+    parser.add_argument(
+        "--fresh", action="store_true", help="ignore and overwrite the cache"
+    )
     args = parser.parse_args(argv)
 
     raw = load_suite()
@@ -490,6 +568,13 @@ async def main(argv: list[str] | None = None) -> int:
         print("could not connect to the database", file=sys.stderr)
         return 2
 
+    if args.fresh and args.cache and args.cache.exists():
+        args.cache.unlink()
+    cached = load_cache(args.cache)
+    if cached:
+        print(f"  resuming: {len(cached)} scenario(s) already measured",
+              file=sys.stderr)
+
     results: list[ScenarioResult] = []
     try:
         retriever = HybridRetriever(pool, get_embedder())
@@ -497,6 +582,11 @@ async def main(argv: list[str] | None = None) -> int:
             arm_settings = settings.model_copy(update={"memory_enabled": arm == "on"})
             print(f"\n=== memory {arm} ===", file=sys.stderr)
             for scenario in scenarios:
+                key = cache_key(scenario["id"], arm)
+                if key in cached:
+                    results.append(cached[key])
+                    print(f"  {scenario['id']} cached", file=sys.stderr, flush=True)
+                    continue
                 result = await run_scenario(
                     scenario,
                     pool=pool,
@@ -506,6 +596,7 @@ async def main(argv: list[str] | None = None) -> int:
                     as_of=as_of,
                 )
                 results.append(result)
+                append_cache(args.cache, result)
                 mark = "ok" if result.succeeded else "MISS"
                 print(
                     f"  {result.scenario_id} {mark} turns={result.turns_to_success} "

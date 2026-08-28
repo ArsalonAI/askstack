@@ -199,6 +199,32 @@ class PostgresMemoryStore:
                 )
         return memory
 
+    async def supersede(self, memory_id: str, *, by: str) -> Memory:
+        """Close one memory's window in favour of an existing one.
+
+        `write(supersedes=...)` handles the common case — a new memory
+        replacing exactly one old one, atomically. Consolidation (§8.2) has the
+        other shape: one semantic memory written first, then *several* episodic
+        memories it contradicts closed against it. Threading that through
+        `write` would mean either N writes or a variadic `supersedes`, and both
+        obscure that the replacement already exists.
+
+        Still append-only in the sense that matters: the superseded row's
+        content is untouched, and it stays queryable, historied, and
+        revertable. Only its validity window closes.
+        """
+        async with self.pool.acquire() as conn, conn.transaction():
+            superseded = await self._close_window(conn, memory_id, superseded_by=by)
+            await self._audit(
+                conn,
+                superseded,
+                op="supersede",
+                before=_audit_payload(superseded),
+                actor="consolidation",
+                trace_id=superseded.trace_id,
+            )
+        return superseded
+
     async def _close_window(
         self, conn: Any, memory_id: str, *, superseded_by: str
     ) -> Memory:
@@ -361,6 +387,37 @@ class PostgresMemoryStore:
             mem_type,
         )
         return [_row_to_memory(row) for row in rows]
+
+    async def live_with_vectors(
+        self, user_id: str, mem_type: MemType
+    ) -> tuple[list[Memory], np.ndarray]:
+        """Live memories and their embeddings, from **one** query.
+
+        Consolidation clusters `vectors[i]` as if it were `memories[i]`, and
+        fetching the two separately makes that alignment a coincidence rather
+        than a guarantee: `live()` orders by `valid_from` and an unordered
+        embedding query returns whatever the planner finds first. Rows would be
+        silently paired with other rows' vectors, and the resulting clusters
+        would group facts that are not similar at all — with no error anywhere
+        and a plausible-looking consolidated memory at the end of it.
+
+        Returning both from a single row set makes the pairing structural.
+        """
+        rows = await self.pool.fetch(
+            f"SELECT {_COLUMNS}, embedding::text AS vector FROM memories"
+            " WHERE user_id = $1 AND mem_type = $2 AND valid_to IS NULL"
+            " ORDER BY valid_from DESC, id",
+            user_id,
+            mem_type,
+        )
+        if not rows:
+            return [], np.empty((0, 0), dtype=np.float32)
+        memories = [_row_to_memory(row) for row in rows]
+        vectors = np.array(
+            [[float(v) for v in r["vector"].strip("[]").split(",")] for r in rows],
+            dtype=np.float32,
+        )
+        return memories, vectors
 
     async def embeddings(self, user_id: str, mem_type: MemType) -> np.ndarray:
         """Live embeddings for one type, as an (n, dim) array.
