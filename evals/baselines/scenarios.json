@@ -1,0 +1,164 @@
+{
+  "recorded_at": "2026-08-28T12:04:32.160463Z",
+  "as_of": "2026-07-29T00:00:00+00:00",
+  "arms": {
+    "off": {
+      "scenarios": 10,
+      "task_success": 0.8,
+      "turns_to_success": 1.875,
+      "cost_per_completed_task": 0.17012525,
+      "total_cost_usd": 1.897421,
+      "errored": 0
+    },
+    "on": {
+      "scenarios": 10,
+      "task_success": 0.8,
+      "turns_to_success": 1.75,
+      "cost_per_completed_task": 0.412396125,
+      "total_cost_usd": 4.730116,
+      "errored": 0
+    }
+  },
+  "scenarios": [
+    {
+      "id": "s01",
+      "arm": "off",
+      "succeeded": true,
+      "turns_to_success": 2,
+      "cost_usd": 0.1323
+    },
+    {
+      "id": "s02",
+      "arm": "off",
+      "succeeded": true,
+      "turns_to_success": 2,
+      "cost_usd": 0.2188
+    },
+    {
+      "id": "s03",
+      "arm": "off",
+      "succeeded": false,
+      "turns_to_success": null,
+      "cost_usd": 0.1493
+    },
+    {
+      "id": "s04",
+      "arm": "off",
+      "succeeded": true,
+      "turns_to_success": 1,
+      "cost_usd": 0.1704
+    },
+    {
+      "id": "s05",
+      "arm": "off",
+      "succeeded": false,
+      "turns_to_success": null,
+      "cost_usd": 0.3871
+    },
+    {
+      "id": "s06",
+      "arm": "off",
+      "succeeded": true,
+      "turns_to_success": 2,
+      "cost_usd": 0.1607
+    },
+    {
+      "id": "s07",
+      "arm": "off",
+      "succeeded": true,
+      "turns_to_success": 2,
+      "cost_usd": 0.1194
+    },
+    {
+      "id": "s08",
+      "arm": "off",
+      "succeeded": true,
+      "turns_to_success": 2,
+      "cost_usd": 0.2099
+    },
+    {
+      "id": "s09",
+      "arm": "off",
+      "succeeded": true,
+      "turns_to_success": 2,
+      "cost_usd": 0.103
+    },
+    {
+      "id": "s10",
+      "arm": "off",
+      "succeeded": true,
+      "turns_to_success": 2,
+      "cost_usd": 0.2465
+    },
+    {
+      "id": "s01",
+      "arm": "on",
+      "succeeded": true,
+      "turns_to_success": 2,
+      "cost_usd": 0.2563
+    },
+    {
+      "id": "s02",
+      "arm": "on",
+      "succeeded": true,
+      "turns_to_success": 2,
+      "cost_usd": 0.3604
+    },
+    {
+      "id": "s03",
+      "arm": "on",
+      "succeeded": false,
+      "turns_to_success": null,
+      "cost_usd": 0.35
+    },
+    {
+      "id": "s04",
+      "arm": "on",
+      "succeeded": true,
+      "turns_to_success": 1,
+      "cost_usd": 0.1933
+    },
+    {
+      "id": "s05",
+      "arm": "on",
+      "succeeded": false,
+      "turns_to_success": null,
+      "cost_usd": 1.081
+    },
+    {
+      "id": "s06",
+      "arm": "on",
+      "succeeded": true,
+      "turns_to_success": 2,
+      "cost_usd": 1.0988
+    },
+    {
+      "id": "s07",
+      "arm": "on",
+      "succeeded": true,
+      "turns_to_success": 2,
+      "cost_usd": 0.396
+    },
+    {
+      "id": "s08",
+      "arm": "on",
+      "succeeded": true,
+      "turns_to_success": 2,
+      "cost_usd": 0.4126
+    },
+    {
+      "id": "s09",
+      "arm": "on",
+      "succeeded": true,
+      "turns_to_success": 1,
+      "cost_usd": 0.2593
+    },
+    {
+      "id": "s10",
+      "arm": "on",
+      "succeeded": true,
+      "turns_to_success": 2,
+      "cost_usd": 0.3225
+    }
+  ]
+}

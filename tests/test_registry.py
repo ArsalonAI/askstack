@@ -13,7 +13,13 @@ import yaml
 
 from app.facts.areas import UnknownArea
 from app.interfaces import Aggregate, Chunk, Entity, Memory
-from app.tools.registry import ALWAYS_INJECTED, BY_NAME, CATALOG, ToolRegistry
+from app.tools.registry import (
+    ALWAYS_INJECTED,
+    BY_NAME,
+    CATALOG,
+    ToolRegistry,
+    coerce,
+)
 
 AS_OF = datetime(2026, 7, 29, tzinfo=UTC)
 
@@ -380,3 +386,58 @@ class TestDispatch:
         outcome = await registry(StubFacts(entity())).dispatch(name, arguments, as_of=AS_OF)
         assert not outcome.is_error, outcome.rendered
         assert outcome.rendered
+
+
+class TestArgumentCoercion:
+    """A tool schema is a request, not a guarantee.
+
+    Without `strict: true` the API does not validate `tool_use.input` against
+    the declared schema. A model that reads "over the last 30 days" will
+    sometimes send `"30"` where the schema says integer, and asyncpg then fails
+    at the driver with `'str' object cannot be interpreted as an integer` —
+    which surfaced as `upstream_unavailable` and killed a whole cross-session
+    scenario, because a type error inside a tool is indistinguishable from the
+    API being down at the point it gets caught.
+    """
+
+    def test_a_stringified_integer_is_coerced(self):
+        assert coerce("stale_prs", {"threshold_days": "30"})["threshold_days"] == 30
+
+    def test_whitespace_is_tolerated(self):
+        assert coerce("stale_prs", {"threshold_days": " 14 "})["threshold_days"] == 14
+
+    def test_an_actual_integer_is_untouched(self):
+        assert coerce("stale_prs", {"threshold_days": 14})["threshold_days"] == 14
+
+    def test_optional_integers_are_coerced_too(self):
+        args = coerce("open_issues", {"older_than_days": "90"})
+        assert args["older_than_days"] == 90
+
+    def test_absent_and_null_fields_are_left_alone(self):
+        assert coerce("open_issues", {}) == {}
+        assert coerce("open_issues", {"older_than_days": None})["older_than_days"] is None
+
+    def test_a_non_numeric_value_is_a_tool_error_not_a_crash(self):
+        """§6.4's treatment of every other bad argument: tell the model what was
+        wrong so it can retry, rather than raising through the loop."""
+        with pytest.raises(ValueError, match="whole number"):
+            coerce("stale_prs", {"threshold_days": "two weeks"})
+
+    def test_a_bad_argument_surfaces_as_is_error(self):
+        """The dispatch-level contract, not just the helper's."""
+        import asyncio
+
+        outcome = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+            registry().dispatch("stale_prs", {"threshold_days": "soon"}, as_of=AS_OF)
+        )
+        assert outcome.is_error
+        assert "whole number" in outcome.rendered
+
+    def test_numbers_sent_as_strings_to_entity_tools_are_coerced(self):
+        assert coerce("pr_state", {"number": "15806"})["number"] == 15806
+
+    def test_a_boolean_is_not_silently_read_as_an_integer(self):
+        """`True` is an `int` in Python. Coercing it to 1 would turn a
+        malformed argument into a plausible-looking threshold."""
+        with pytest.raises(ValueError, match="whole number"):
+            coerce("stale_prs", {"threshold_days": True})

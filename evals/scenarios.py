@@ -77,6 +77,8 @@ class SessionResult:
     # Memories §8.1 extracted when this session ended. The number that explains
     # whether the *next* session had anything to load.
     extracted: int = 0
+    # Rolled up on the cache path, where per-turn results are not retained.
+    memories_loaded: int = 0
 
     @property
     def cost_usd(self) -> float:
@@ -90,6 +92,10 @@ class ScenarioResult:
     sessions: list[SessionResult] = field(default_factory=list)
     succeeded: bool = False
     turns_to_success: int | None = None
+    # A cached row carries the scored outcome and the cost, not the per-turn
+    # detail. Reporting `mem_loaded=0` for one would state as a measurement
+    # something the cache simply does not hold.
+    from_cache: bool = False
 
     @property
     def cost_usd(self) -> float:
@@ -142,10 +148,12 @@ def load_cache(path: Path | None) -> dict[str, ScenarioResult]:
             arm=row["arm"],
             succeeded=row["succeeded"],
             turns_to_success=row["turns_to_success"],
+            from_cache=True,
         )
         session = SessionResult(index=0, session_id=None)
         session.turns = [TurnResult(prompt="", cost_usd=row["cost_usd"])]
         session.extracted = row.get("extracted", 0)
+        session.memories_loaded = row.get("memories_loaded", 0)
         result.sessions = [session]
         cached[cache_key(result.scenario_id, result.arm)] = result
     if stale:
@@ -169,6 +177,9 @@ def append_cache(path: Path | None, result: ScenarioResult) -> None:
                     "turns_to_success": result.turns_to_success,
                     "cost_usd": round(result.cost_usd, 6),
                     "extracted": sum(s.extracted for s in result.sessions),
+                    "memories_loaded": sum(
+                        t.memories_loaded for s in result.sessions for t in s.turns
+                    ),
                 }
             )
             + "\n"
@@ -473,26 +484,33 @@ def print_report(results: list[ScenarioResult], arms: dict) -> None:
         print("\n  memory on vs off")
         print(f"    task success      {off['task_success']:.2f} → {on['task_success']:.2f}")
         if on["turns_to_success"] and off["turns_to_success"]:
-            delta = off["turns_to_success"] - on["turns_to_success"]
+            saved = off["turns_to_success"] - on["turns_to_success"]
+            direction = "fewer" if saved > 0 else "more"
             print(
                 f"    turns to success  {off['turns_to_success']:.2f} → "
-                f"{on['turns_to_success']:.2f}  ({delta:+.2f})"
+                f"{on['turns_to_success']:.2f}  "
+                f"({abs(saved):.2f} {direction} turns with memory)"
             )
 
     print("\n  per scenario")
     for result in sorted(results, key=lambda r: (r.scenario_id, r.arm)):
         mark = "ok " if result.succeeded else "MISS"
         turns = result.turns_to_success or "—"
-        loaded = sum(t.memories_loaded for s in result.sessions for t in s.turns)
+        loaded = sum(t.memories_loaded for s in result.sessions for t in s.turns) or sum(
+            s.memories_loaded for s in result.sessions
+        )
         writes = sum(t.memory_writes for s in result.sessions for t in s.turns)
         extracted = sum(s.extracted for s in result.sessions)
+        cached = "  (cached)" if result.from_cache else ""
         print(
             f"    {result.scenario_id}  {result.arm:<3}  {mark}  turns={turns}  "
             f"mem_loaded={loaded}  extracted={extracted}  agent_writes={writes}  "
-            f"${result.cost_usd:.3f}"
+            f"${result.cost_usd:.3f}{cached}"
         )
         if result.error:
             print(f"          error: {result.error}")
+        elif not result.succeeded and result.from_cache:
+            print("          (cached; per-turn detail not retained — rerun with --fresh)")
         elif not result.succeeded:
             # A miss with no detail is unactionable: "the agent did not do the
             # task" does not say whether it called nothing, called the wrong

@@ -308,6 +308,56 @@ def _render_entity(kind: str, ref: str, entity: Entity | None) -> str:
     return "\n".join(lines)
 
 
+def coerce(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Bring tool inputs to the types their schema declares.
+
+    A tool schema is a *request*, not a guarantee. Without `strict: true` the
+    API does not validate `tool_use.input` against it, and a model that reads
+    "over the last 30 days" will sometimes send `"30"` where the schema says
+    integer. asyncpg then rejects it at the driver — `'str' object cannot be
+    interpreted as an integer` — which surfaced as `upstream_unavailable` and
+    took down a whole scenario, because a type error inside a tool is
+    indistinguishable from the API being down at the point it is caught.
+
+    Coercing here rather than at each call site is the point: dispatch is the
+    boundary between text a model produced and code that assumes types, and a
+    boundary that trusts its input is not a boundary. This also keeps the fix
+    provider-independent — `strict: true` would close it for Anthropic, but the
+    registry should not be relying on any provider's validation to stay
+    type-safe.
+
+    A value that cannot be coerced is a tool error, not a crash: the model gets
+    told what was wrong and can retry, which is the §6.4 treatment of every
+    other bad argument.
+    """
+    schema = BY_NAME[name].input_schema.get("properties", {})
+    out = dict(arguments)
+    for key, spec in schema.items():
+        if key not in out or out[key] is None:
+            continue
+        declared = spec.get("type")
+        value = out[key]
+        if declared == "integer":
+            # `bool` is an `int` subclass, so an unguarded isinstance check
+            # would wave `True` through as the integer 1 — a malformed argument
+            # arriving as a plausible-looking threshold. Rejected explicitly.
+            if isinstance(value, bool):
+                raise ValueError(
+                    f"{name}: {key} must be a whole number, got {value!r}"
+                )
+            if isinstance(value, int):
+                continue
+            try:
+                out[key] = int(str(value).strip())
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"{name}: {key} must be a whole number, got {value!r}"
+                ) from None
+        elif declared == "string" and not isinstance(value, str):
+            out[key] = str(value)
+    return out
+
+
 def _render_memory_write(memory) -> str:
     """Confirms the write and shows its id, so the model can supersede it later
     in the same session rather than writing a near-duplicate."""
@@ -413,6 +463,11 @@ class ToolRegistry:
 
         if name not in BY_NAME:
             return done(f"No tool named {name!r}.", is_error=True)
+
+        try:
+            arguments = coerce(name, arguments)
+        except ValueError as exc:
+            return done(str(exc), is_error=True)
 
         try:
             return done(*await self._call(name, arguments, as_of, trace))
