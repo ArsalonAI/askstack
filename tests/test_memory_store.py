@@ -383,3 +383,56 @@ class TestLoadsAtSessionStart:
         )
         assert block.memories == []
         assert "private" not in block.text
+
+
+class TestGovernanceEndpointSurface:
+    """PRD §5.5 — provenance on every write, and one-action revert.
+
+    These exercise the store methods `/memory`, `/memory/{id}/history`, and
+    `/memory/{id}/revert` are built on. The HTTP layer is a thin projection
+    (`app/main.py`); what has to be true is that the data behind it supports
+    the governance claim, which is a database property and not a routing one.
+    """
+
+    async def test_a_reverted_memory_exposes_its_whole_history(self, store):
+        original = await store.write("u1", "semantic", "good", embedding=vec(40))
+        await store.write(
+            "u1", "semantic", "bad", embedding=vec(41), supersedes=original.id
+        )
+        # Reverting the superseded memory brings its content back as a new
+        # revision without erasing that it was superseded.
+        reverted = await store.revert(original.id, 1, actor="arsalon")
+        history = await store.history(original.id)
+
+        assert [m.revision for m in history] == [1, 2]
+        assert reverted.content == "good"
+        assert [row["op"] for row in await store.audit(original.id)] == [
+            "revert",
+            "supersede",
+            "create",
+        ]
+
+    async def test_the_audit_trail_names_who_did_what(self, store):
+        """An audit row with no actor cannot answer the only question anyone
+        asks of one."""
+        original = await store.write("u1", "semantic", "x", embedding=vec(42))
+        await store.revert(original.id, 1, actor="arsalon")
+        trail = await store.audit(original.id)
+        assert {row["actor"] for row in trail} == {"agent", "arsalon"}
+
+    async def test_listing_is_scoped_and_filterable_by_type(self, store):
+        await store.write("u1", "semantic", "sem", embedding=vec(43))
+        await store.write("u1", "episodic", "epi", embedding=vec(44))
+        await store.write("u2", "semantic", "theirs", embedding=vec(45))
+
+        assert len(await store.live("u1")) == 2
+        assert [m.content for m in await store.live("u1", "semantic")] == ["sem"]
+        assert [m.content for m in await store.live("u2")] == ["theirs"]
+
+    async def test_superseded_memories_are_absent_from_the_live_list(self, store):
+        """They remain queryable by id and revertable — §8.3's floor removes a
+        memory from *loading*, not from existence."""
+        old = await store.write("u1", "semantic", "old", embedding=vec(46))
+        await store.write("u1", "semantic", "new", embedding=vec(47), supersedes=old.id)
+        assert [m.content for m in await store.live("u1")] == ["new"]
+        assert len(await store.history(old.id)) == 1

@@ -21,8 +21,12 @@ from pydantic import BaseModel, Field
 from app.config import settings
 from app.facts.store import PostgresFactsStore
 from app.memory.lifecycle import Extractor
-from app.memory.manager import MemoryManager
-from app.memory.store import PostgresMemoryStore
+from app.memory.manager import MemoryManager, effective_confidence
+from app.memory.store import (
+    MemoryNotFound,
+    PostgresMemoryStore,
+    RevisionNotFound,
+)
 from app.orchestrator import Orchestrator, sse
 from app.retrieval.embedder import get_embedder
 from app.retrieval.hybrid import HybridRetriever
@@ -185,6 +189,101 @@ async def end_session(session_id: str) -> dict:
         "considered": report.considered,
         "discarded_low_confidence": report.discarded_low_confidence,
     }
+
+
+def _memory_json(memory) -> dict:
+    return {
+        "id": memory.id,
+        "revision": memory.revision,
+        "user_id": memory.user_id,
+        "type": memory.mem_type,
+        "content": memory.content,
+        "entities": list(memory.entities),
+        "confidence": round(memory.confidence, 3),
+        "effective_confidence": round(effective_confidence(memory), 3),
+        "created_by": memory.created_by,
+        "source_session_id": memory.source_session_id,
+        "source_ids": list(memory.source_ids),
+        "valid_from": memory.valid_from.isoformat(),
+        "valid_to": memory.valid_to.isoformat() if memory.valid_to else None,
+        "trace_id": memory.trace_id,
+    }
+
+
+@app.get("/memory")
+async def list_memory(user_id: str, type: str | None = None) -> dict:
+    """§11.1. Every live memory for one user.
+
+    `effective_confidence` is rendered alongside the stored value rather than
+    instead of it (§8.3). A UI showing only the decayed number cannot explain
+    why a memory stopped being loaded, and one showing only the stored number
+    contradicts what the agent actually saw.
+    """
+    store = PostgresMemoryStore(app.state.pool)
+    memories = await store.live(user_id, type)
+    return {"user_id": user_id, "memories": [_memory_json(m) for m in memories]}
+
+
+@app.get("/memory/{memory_id}/history")
+async def memory_history(memory_id: str) -> dict:
+    """§11.1 — all revisions, oldest first.
+
+    The read side of ADR 4. Nothing is ever edited in place, so this is the
+    complete record of what a memory has ever said, which is what makes the
+    autonomy of ADR 5 recoverable rather than merely asserted.
+    """
+    store = PostgresMemoryStore(app.state.pool)
+    try:
+        revisions = await store.history(memory_id)
+    except MemoryNotFound:
+        return {"error": {"code": "memory_not_found", "message": memory_id}}
+    return {
+        "id": memory_id,
+        "revisions": [_memory_json(m) for m in revisions],
+        "audit": [
+            {
+                "op": row["op"],
+                "revision": row["revision"],
+                "actor": row["actor"],
+                "at": row["at"].isoformat(),
+                "trace_id": row["trace_id"],
+            }
+            for row in await store.audit(memory_id)
+        ],
+    }
+
+
+class RevertRequest(BaseModel):
+    to_revision: int = Field(ge=1)
+    actor: str = Field(min_length=1, max_length=200)
+
+
+@app.post("/memory/{memory_id}/revert")
+async def revert_memory(memory_id: str, request: RevertRequest) -> dict:
+    """§11.1, PRD §5.5's one-action rollback.
+
+    Appends a new revision carrying the old content; it does not roll back.
+    A destructive rollback would erase the evidence that a revert happened,
+    which is the one thing the audit trail has to show.
+    """
+    store = PostgresMemoryStore(app.state.pool)
+    try:
+        reverted = await store.revert(
+            memory_id, request.to_revision, actor=request.actor
+        )
+    except MemoryNotFound:
+        return {"error": {"code": "memory_not_found", "message": memory_id}}
+    except RevisionNotFound:
+        # §11.3 gives these different codes on purpose: a missing memory is a
+        # 404 and a missing revision is a 400, and collapsing them would make
+        # "you asked for revision 99" indistinguishable from "no such memory".
+        return {
+            "error": {
+                "code": "revision_not_found",
+                "message": f"{memory_id} has no revision {request.to_revision}",
+            }
+        }
+    return _memory_json(reverted)
 
 
 @app.get("/sessions/{session_id}")
