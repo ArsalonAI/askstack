@@ -86,6 +86,7 @@ python scripts/gen_synthetic_tools.py --size 200   # pad the catalog for the cur
 python evals/runner.py --agent            # the full agent turn, 50 questions
 python evals/scenarios.py                 # cross-session, memory on vs off
 python evals/scenarios.py --check         # validate the suite, spends nothing
+python evals/ablation.py --json results/ablation_<date>.json   # memory on/off, bootstrap CIs
 ```
 
 The two runner paths are deliberate. `--agent` measures the system a user meets
