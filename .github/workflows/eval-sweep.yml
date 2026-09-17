@@ -59,6 +59,12 @@ jobs:
           path: ~/.cache/huggingface
           key: hf-${{ hashFiles('pyproject.toml') }}
 
+      # The pgvector image ships the extensions but does not create them, and a
+      # `services:` container cannot mount scripts/init_db.sql the way
+      # docker-compose does. Without this every migration fails.
+      - name: Create Postgres extensions
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f scripts/init_db.sql
+
       - name: Migrate
         run: uv run alembic -c scripts/migrations/alembic.ini upgrade head
 
